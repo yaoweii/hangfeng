@@ -1,13 +1,12 @@
 // =============================================================================
-// hafeng_geometry.cpp - 焊缝几何计算模块
+// plane_surface_hanfeng_util.cpp — 平面板/曲面板焊缝计算实现
 // =============================================================================
 //
-// 这里放置与模型读取无关的纯几何逻辑：
-// - 平面板有效表面构造
-// - 曲面三角面集合构造
-// - 点到目标表面的距离判定
-// - 候选边界折线裁剪
-// - 焊缝折线去重
+// 实现焊缝折线的核心计算逻辑（模型读取无关）：
+//   - 平面板有效表面构造、曲面三角面集合构造
+//   - BVH 加速结构构建与查询
+//   - 线段-三角形精确相交区间计算
+//   - 候选边界折线裁剪与焊缝折线去重
 // =============================================================================
 
 #include "hanfeng/plane_surface_hanfeng_util.hpp"
@@ -28,6 +27,7 @@ namespace hanfeng {
 
 		using ProfilingClock = std::chrono::steady_clock;
 
+		/// 三维三角形（含预计算包围盒，用于加速距离查询）
 		struct Triangle3 {
 			SPAposition a;
 			SPAposition b;
@@ -35,6 +35,7 @@ namespace hanfeng {
 			SPAbox box;
 		};
 
+		/// 投影到平面后的二维边界环（含 UV 包围盒用于快速排除）
 		struct ProjectedLoop {
 			Polyline3 world_points;
 			std::vector<std::array<double, 2>> uv_points;
@@ -48,6 +49,7 @@ namespace hanfeng {
 			};
 		};
 
+		/// 平面板单侧主面的几何信息（含外法线方向和投影环）
 		struct PlaneFaceGeometry {
 			SPAposition origin;
 			SPAunit_vector normal;
@@ -58,6 +60,7 @@ namespace hanfeng {
 			std::vector<ProjectedLoop> inner_loops;
 		};
 
+		/// BVH 节点：叶节点持有三角形范围，中间节点持有左右子索引
 		struct SurfaceBvhNode {
 			SPAbox box;
 			std::size_t begin = 0;
@@ -70,28 +73,33 @@ namespace hanfeng {
 			}
 		};
 
+		/// 平面板完整几何（两侧主面 + 侧壁三角形 + 侧壁 BVH）
 		struct PlanePanelGeometry {
 			std::vector<PlaneFaceGeometry> main_faces;
 			std::vector<Triangle3> side_triangles;
 			std::vector<SurfaceBvhNode> side_bvh_nodes;
 		};
 
+		/// 曲面板几何（展开三角形 + BVH 加速结构）
 		struct SurfaceGeometry {
 			std::vector<Triangle3> triangles;
 			std::vector<SurfaceBvhNode> bvh_nodes;
 		};
 
+		/// 曲面上最近点及其所在三角形的法向量
 		struct SurfaceClosestPoint {
 			SPAposition point;
 			SPAunit_vector triangle_normal;
 		};
 
+		/// 点相对于曲面体的分类：外部 / 内部 / 边界上
 		enum class SolidPointClassification {
 			Outside,
 			Inside,
 			OnBoundary
 		};
 
+		/// 线段与曲面体的交点事件：Crossing=穿越，Touching=擦过
 		struct SolidIntersectionEvent {
 			double t = 0.0;
 
@@ -101,21 +109,25 @@ namespace hanfeng {
 			} type = Type::Touching;
 		};
 
+		/// 平面板候选边界环（含外法线方向）
 		struct PlaneCandidateLoop {
 			Polyline3 loop;
 			SPAunit_vector outward_normal;
 		};
 
+		/// 参数区间 [start, end]，用于线段命中区间的描述
 		struct Interval {
 			double start = 0.0;
 			double end = 0.0;
 		};
 
+		/// 参数线性函数 f(t) = constant + slope * t
 		struct LinearFunction {
 			double constant = 0.0;
 			double slope = 0.0;
 		};
 
+		/// 参数二次函数 f(t) = constant + linear*t + quadratic*t²
 		struct QuadraticFunction {
 			double constant = 0.0;
 			double linear = 0.0;
@@ -125,6 +137,7 @@ namespace hanfeng {
 		constexpr double kIntervalEpsilon = 1.0e-9;
 		thread_local WeldProfilingData g_weld_profiling_data;
 
+		/// RAII 计时器：构造时记录起点，析构时累加耗时到目标毫秒引用
 		struct ScopedDurationAccumulator {
 			double& destination_ms;
 			ProfilingClock::time_point start = ProfilingClock::now();
@@ -138,6 +151,7 @@ namespace hanfeng {
 			}
 		};
 
+		/// 线段上参数 t 处的插值点：t=0 返回 start，t=1 返回 end
 		SPAposition interpolate_position(const SPAposition& start,
 			const SPAposition& end,
 			double t) {
@@ -146,14 +160,17 @@ namespace hanfeng {
 				start.z() + (end.z() - start.z()) * t);
 		}
 
+		/// 将数值裁剪到 [0, 1] 区间
 		double clamp01(double value) {
 			return std::max(0.0, std::min(1.0, value));
 		}
 
+		/// 浮点近似相等判断
 		bool nearly_equal(double lhs, double rhs, double epsilon = kIntervalEpsilon) {
 			return std::fabs(lhs - rhs) <= epsilon;
 		}
 
+		/// 计算候选环的有效线段数（首尾相同时减 1）
 		std::size_t candidate_loop_segment_count(const Polyline3& loop) {
 			if (loop.size() < 2U) {
 				return 0U;
@@ -161,15 +178,18 @@ namespace hanfeng {
 			return (loop.front() == loop.back()) ? (loop.size() - 1U) : loop.size();
 		}
 
+		/// 求线性函数在 t 处的值
 		double evaluate(const LinearFunction& function, double t) {
 			return function.constant + function.slope * t;
 		}
 
+		/// 求二次函数在 t 处的值
 		double evaluate(const QuadraticFunction& function, double t) {
 			return function.constant + function.linear * t +
 				function.quadratic * t * t;
 		}
 
+		/// 两个线性函数相乘得到二次函数
 		QuadraticFunction multiply(const LinearFunction& left,
 			const LinearFunction& right) {
 			return QuadraticFunction{
@@ -179,6 +199,7 @@ namespace hanfeng {
 			};
 		}
 
+		/// 两个线性函数相减
 		LinearFunction subtract(const LinearFunction& left,
 			const LinearFunction& right) {
 			return LinearFunction{
@@ -187,6 +208,7 @@ namespace hanfeng {
 			};
 		}
 
+		/// 两个二次函数相减
 		QuadraticFunction subtract(const QuadraticFunction& left,
 			const QuadraticFunction& right) {
 			return QuadraticFunction{
@@ -196,6 +218,7 @@ namespace hanfeng {
 			};
 		}
 
+		/// 构造二次函数 ||offset + t*direction||² < radius²
 		QuadraticFunction squared_norm_less_than(const SPAvector& offset,
 			const SPAvector& direction,
 			double radius_squared) {
@@ -206,6 +229,7 @@ namespace hanfeng {
 			};
 		}
 
+		/// 对区间列表排序、合并重叠、过滤极小区间
 		std::vector<Interval> normalise_intervals(std::vector<Interval> intervals,
 			double epsilon = kIntervalEpsilon) {
 			std::vector<Interval> filtered;
@@ -245,6 +269,7 @@ namespace hanfeng {
 			return merged;
 		}
 
+		/// 两个有序区间集合求交集
 		std::vector<Interval> intersect_interval_sets(const std::vector<Interval>& left,
 			const std::vector<Interval>& right,
 			double epsilon = kIntervalEpsilon) {
@@ -274,6 +299,7 @@ namespace hanfeng {
 			return result;
 		}
 
+		/// 求区间集合在 [0,1] 上的补集
 		std::vector<Interval> complement_on_unit_interval(
 			const std::vector<Interval>& covered,
 			double epsilon = kIntervalEpsilon) {
@@ -292,6 +318,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result), epsilon);
 		}
 
+		/// 将子线段上的局部区间映射回父线段参数空间
 		std::vector<Interval> remap_intervals_to_parent(
 			const std::vector<Interval>& local_intervals,
 			const Interval& parent,
@@ -312,6 +339,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result), epsilon);
 		}
 
+		/// 求解线性不等式 f(t) ≤ 0 或 f(t) ≥ 0 的区间解
 		std::vector<Interval> solve_linear_inequality(const LinearFunction& function,
 			bool less_equal) {
 			if (std::fabs(function.slope) <= kIntervalEpsilon) {
@@ -335,6 +363,7 @@ namespace hanfeng {
 			return std::vector<Interval>{ { -std::numeric_limits<double>::infinity(), root } };
 		}
 
+		/// 求解二次不等式 f(t) ≤ 0 或 f(t) ≥ 0 的区间解（含判别式分析）
 		std::vector<Interval> solve_quadratic_inequality(const QuadraticFunction& function,
 			bool less_equal) {
 			if (std::fabs(function.quadratic) <= kIntervalEpsilon) {
@@ -394,6 +423,7 @@ namespace hanfeng {
 			return std::vector<Interval>{ { root0, root1 } };
 		}
 
+		/// 将区间裁剪到 [0,1] 范围内
 		std::vector<Interval> clip_intervals_to_unit(const std::vector<Interval>& intervals) {
 			std::vector<Interval> clipped;
 			for (const Interval& interval : intervals) {
@@ -406,6 +436,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(clipped));
 		}
 
+		/// 构造线性函数表示向量与参数射线的点乘随 t 的变化
 		LinearFunction dot_linear(const SPAvector& vector,
 			const SPAposition& start,
 			const SPAvector& direction,
@@ -417,6 +448,7 @@ namespace hanfeng {
 			};
 		}
 
+		/// 点到线段最短距离平方
 		double point_segment_distance_squared(const SPAposition& point,
 			const SPAposition& start,
 			const SPAposition& end) {
@@ -432,6 +464,7 @@ namespace hanfeng {
 			return (point - closest).len_sq();
 		}
 
+		/// 三角形上离给定点最近的点（经典 7 区域 Voronoi 算法）
 		SPAposition closest_point_on_triangle(const SPAposition& point,
 			const Triangle3& triangle) {
 			const SPAvector ab = triangle.b - triangle.a;
@@ -482,12 +515,14 @@ namespace hanfeng {
 			return triangle.a + ab * v + ac * w;
 		}
 
+		/// 点到三角形最短距离平方
 		double point_triangle_distance_squared(const SPAposition& point,
 			const Triangle3& triangle) {
 			const SPAposition closest = closest_point_on_triangle(point, triangle);
 			return (point - closest).len_sq();
 		}
 
+		/// 点到包围盒最短距离平方
 		double point_box_distance_squared(const SPAposition& point,
 			const SPAbox& box) {
 			if (!box.is_valid()) {
@@ -509,6 +544,7 @@ namespace hanfeng {
 			return distance_squared;
 		}
 
+		/// 合并两个包围盒
 		SPAbox merge_boxes(const SPAbox& left, const SPAbox& right) {
 			if (!left.is_valid()) {
 				return right;
@@ -525,6 +561,7 @@ namespace hanfeng {
 					std::max(left.max_corner().z(), right.max_corner().z())));
 		}
 
+		/// 按给定边距扩展包围盒
 		SPAbox expand_box(const SPAbox& box, double margin) {
 			if (!box.is_valid()) {
 				return box;
@@ -538,10 +575,12 @@ namespace hanfeng {
 					box.max_corner().z() + margin));
 		}
 
+		/// 包围盒质心在指定轴上的坐标
 		double box_centroid_coordinate(const SPAbox& box, std::size_t axis) {
 			return 0.5 * (box.min_corner()[axis] + box.max_corner()[axis]);
 		}
 
+		/// 扩展投影环的 UV 包围盒以包含新 UV 点
 		void expand_uv_bounds(ProjectedLoop& loop, const std::array<double, 2>& uv) {
 			loop.uv_min[0] = std::min(loop.uv_min[0], uv[0]);
 			loop.uv_min[1] = std::min(loop.uv_min[1], uv[1]);
@@ -549,6 +588,7 @@ namespace hanfeng {
 			loop.uv_max[1] = std::max(loop.uv_max[1], uv[1]);
 		}
 
+		/// 快速判断 UV 点是否在投影环的 UV 包围盒内
 		bool uv_box_contains_point(const ProjectedLoop& loop,
 			const std::array<double, 2>& uv,
 			double epsilon = 1.0e-8) {
@@ -558,6 +598,7 @@ namespace hanfeng {
 				uv[1] <= loop.uv_max[1] + epsilon;
 		}
 
+		/// 快速判断 UV 线段包围盒是否与投影环包围盒重叠
 		bool uv_segment_box_overlaps_loop_box(const std::array<double, 2>& start,
 			const std::array<double, 2>& end,
 			const ProjectedLoop& loop,
@@ -572,6 +613,7 @@ namespace hanfeng {
 				segment_min_y > loop.uv_max[1]);
 		}
 
+		/// 判断线段是否与包围盒相交（Slab 方法）
 		bool segment_intersects_box(const SPAposition& start,
 			const SPAposition& end,
 			const SPAbox& box,
@@ -609,6 +651,7 @@ namespace hanfeng {
 			return true;
 		}
 
+		/// 判断射线是否与包围盒相交
 		bool ray_intersects_box(const SPAposition& origin,
 			const SPAvector& direction,
 			const SPAbox& box,
@@ -645,6 +688,7 @@ namespace hanfeng {
 			return t_max >= 0.0;
 		}
 
+		/// 为三个顶点构建包围盒
 		SPAbox build_triangle_box(const SPAposition& a,
 			const SPAposition& b,
 			const SPAposition& c) {
@@ -657,12 +701,14 @@ namespace hanfeng {
 					std::max({ a.z(), b.z(), c.z() })));
 		}
 
+		/// 用三个顶点 + 预计算包围盒构建 Triangle3
 		Triangle3 make_triangle3(const SPAposition& a,
 			const SPAposition& b,
 			const SPAposition& c) {
 			return Triangle3{ a, b, c, build_triangle_box(a, b, c) };
 		}
 
+		/// 递归构建三角形 BVH：沿质心最长轴中位数分割，叶节点阈值 16 个三角形
 		int build_triangle_bvh_recursive(std::vector<Triangle3>& triangles,
 			std::vector<SurfaceBvhNode>& nodes,
 			std::size_t begin,
@@ -733,6 +779,7 @@ namespace hanfeng {
 			return node_index;
 		}
 
+		/// 构建三角形 BVH 的入口函数
 		void build_triangle_bvh(std::vector<Triangle3>& triangles,
 			std::vector<SurfaceBvhNode>& nodes) {
 			nodes.clear();
@@ -742,10 +789,12 @@ namespace hanfeng {
 			build_triangle_bvh_recursive(triangles, nodes, 0U, triangles.size());
 		}
 
+		/// 构建曲面几何的 BVH 加速结构
 		void build_surface_bvh(SurfaceGeometry& geometry) {
 			build_triangle_bvh(geometry.triangles, geometry.bvh_nodes);
 		}
 
+		/// 遍历 BVH 中满足包围盒谓词的三角形，对每个调用访问器
 		template <typename BoxPredicate, typename TriangleVisitor>
 		void visit_bvh_triangles(const std::vector<Triangle3>& triangles,
 			const std::vector<SurfaceBvhNode>& nodes,
@@ -787,6 +836,7 @@ namespace hanfeng {
 			}
 		}
 
+		/// 遍历曲面几何中满足条件的三角形
 		template <typename BoxPredicate, typename TriangleVisitor>
 		void visit_surface_triangles(const SurfaceGeometry& geometry,
 			BoxPredicate&& should_visit_box,
@@ -796,6 +846,7 @@ namespace hanfeng {
 				std::forward<TriangleVisitor>(visit_triangle));
 		}
 
+		/// 遍历平面板侧壁三角形
 		template <typename BoxPredicate, typename TriangleVisitor>
 		void visit_plane_side_triangles(const PlanePanelGeometry& geometry,
 			BoxPredicate&& should_visit_box,
@@ -805,6 +856,7 @@ namespace hanfeng {
 				std::forward<TriangleVisitor>(visit_triangle));
 		}
 
+		/// 构造二次函数：参数射线上的点到平面的带状距离不等式
 		QuadraticFunction distance_to_plane_band_function(const SPAposition& start,
 			const SPAvector& direction,
 			const SPAposition& origin,
@@ -820,6 +872,7 @@ namespace hanfeng {
 			};
 		}
 
+		/// 同上，使用未归一化平面法向量
 		QuadraticFunction distance_to_plane_band_function(const SPAposition& start,
 			const SPAvector& direction,
 			const SPAposition& origin,
@@ -835,6 +888,7 @@ namespace hanfeng {
 			};
 		}
 
+		/// 精确计算线段参数空间上与三角形距离 ≤ tolerance 的区间（基于参数函数代数求解）
 		std::vector<Interval> exact_segment_triangle_intervals(const SPAposition& start,
 			const SPAposition& end,
 			const Triangle3& triangle,
@@ -963,6 +1017,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(hit_intervals));
 		}
 
+		/// 从边界环拟合平面参数（原点 + 法向量），遍历三点组合求非退化叉积
 		bool fit_plane_from_loop(const Polyline3& loop, SPAposition& origin,
 			SPAunit_vector& normal) {
 			if (loop.size() < 3U) {
@@ -984,6 +1039,7 @@ namespace hanfeng {
 			return false;
 		}
 
+		/// 根据法向量构建平面正交基 (u, v)，自动避免退化
 		std::pair<SPAunit_vector, SPAunit_vector> build_plane_basis(
 			const SPAunit_vector& normal) {
 			SPAvector reference(1.0, 0.0, 0.0);
@@ -997,6 +1053,7 @@ namespace hanfeng {
 			return { u, v };
 		}
 
+		/// 将三维点投影到平面的 UV 坐标
 		std::array<double, 2> project_to_plane_uv(const SPAposition& point,
 			const SPAposition& origin,
 			const SPAunit_vector& u_axis,
@@ -1005,6 +1062,7 @@ namespace hanfeng {
 			return { offset % u_axis, offset % v_axis };
 		}
 
+		/// 判断二维点是否在线段上（叉积共线 + 投影在范围内）
 		bool point_on_segment_2d(double px, double py,
 			double ax, double ay,
 			double bx, double by,
@@ -1024,6 +1082,7 @@ namespace hanfeng {
 			return dot <= length_squared + epsilon;
 		}
 
+		/// 射线法判断二维点是否在投影环内部
 		bool point_in_projected_loop(const std::array<double, 2>& point,
 			const ProjectedLoop& loop,
 			double epsilon) {
@@ -1052,6 +1111,7 @@ namespace hanfeng {
 			return inside;
 		}
 
+		/// 从 PlaneFace 构建平面几何信息（拟合平面 + 投影环 + UV 包围盒）
 		PlaneFaceGeometry build_plane_face_geometry(const PlaneFace& face) {
 			if (face.boundaries.outer_loops.empty()) {
 				throw std::runtime_error("平面板主面缺少外边界，无法构造面域。");
@@ -1091,6 +1151,7 @@ namespace hanfeng {
 			return geometry;
 		}
 
+		/// 在两组对应边界环之间生成侧壁三角面
 		void append_side_wall_triangles(const std::vector<Polyline3>& first_loops,
 			const std::vector<Polyline3>& second_loops,
 			std::vector<Triangle3>& side_triangles) {
@@ -1114,6 +1175,7 @@ namespace hanfeng {
 			}
 		}
 
+		/// 从 PlanePanel 构建完整几何（两侧主面 + 确定外法线方向 + 侧壁 + BVH）
 		PlanePanelGeometry build_plane_panel_geometry(const PlanePanel& panel) {
 			PlanePanelGeometry geometry;
 			geometry.main_faces.push_back(build_plane_face_geometry(panel.face_a));
@@ -1142,6 +1204,7 @@ namespace hanfeng {
 			return geometry;
 		}
 
+		/// 查找曲面上离给定点最近的点及其法向量
 		std::optional<SurfaceClosestPoint> closest_point_on_surface_geometry(
 			const SPAposition& point,
 			const SurfaceGeometry& geometry) {
@@ -1170,6 +1233,7 @@ namespace hanfeng {
 			return best_point;
 		}
 
+		/// 从 SurfacePanel 构建曲面几何（展开三角形 + BVH）
 		SurfaceGeometry build_surface_geometry(const SurfacePanel& panel) {
 			SurfaceGeometry geometry;
 			for (const SurfacePatch& patch : panel.surfaces) {
@@ -1187,6 +1251,7 @@ namespace hanfeng {
 			return geometry;
 		}
 
+		/// 点到曲面几何的最短距离（BVH 加速裁剪）
 		double point_to_surface_geometry_distance(const SPAposition& point,
 			const SurfaceGeometry& geometry) {
 			double best_distance_squared = std::numeric_limits<double>::infinity();
@@ -1201,11 +1266,13 @@ namespace hanfeng {
 			return std::sqrt(best_distance_squared);
 		}
 
+		/// 精确计算线段与三角形的共面重叠区间
 		std::vector<Interval> exact_segment_triangle_coplanar_intervals(
 			const SPAposition& start,
 			const SPAposition& end,
 			const Triangle3& triangle);
 
+		/// Möller-Trumbore 射线-三角形交点检测，返回交点到射线原点距离
 		std::optional<double> ray_triangle_intersection_distance(
 			const SPAposition& origin,
 			const SPAvector& direction,
@@ -1238,6 +1305,7 @@ namespace hanfeng {
 			return distance;
 		}
 
+		/// 线段-三角形交点检测，返回交点在线段上的参数 t ∈ [0,1]；共面返回 nullopt
 		std::optional<double> segment_triangle_intersection_parameter(
 			const SPAposition& start,
 			const SPAposition& end,
@@ -1285,6 +1353,7 @@ namespace hanfeng {
 			return clamp01(parameter);
 		}
 
+		/// 判断点是否在曲面体内部（先检查边界，再用射线法奇偶检测）
 		SolidPointClassification point_in_surface_solid(
 			const SPAposition& point,
 			const SurfaceGeometry& geometry) {
@@ -1337,6 +1406,7 @@ namespace hanfeng {
 				: SolidPointClassification::Outside;
 		}
 
+		/// 根据线段长度自适应选取探测步长
 		double segment_parameter_probe_step(const SPAposition& start,
 			const SPAposition& end) {
 			const double segment_length = (end - start).len();
@@ -1346,6 +1416,7 @@ namespace hanfeng {
 			return std::max(1.0e-9, std::min(1.0e-4, 1.0e-6 / segment_length));
 		}
 
+		/// 在线段上采样点判断其在曲面体内/外/边界（逐步扩大步长探测）
 		SolidPointClassification sample_segment_classification(
 			const SPAposition& start,
 			const SPAposition& end,
@@ -1367,6 +1438,7 @@ namespace hanfeng {
 			return SolidPointClassification::OnBoundary;
 		}
 
+		/// 收集线段穿越曲面体边界的所有事件点（参数 t + Crossing/Touching 类型）
 		std::vector<SolidIntersectionEvent> segment_surface_solid_events(
 			const SPAposition& start,
 			const SPAposition& end,
@@ -1412,6 +1484,7 @@ namespace hanfeng {
 			return events;
 		}
 
+		/// 拓扑共面区间：线段与曲面三角形共面重叠的参数区间集合
 		std::vector<Interval> exact_segment_topo_coplanar_intervals(
 			const SPAposition& start,
 			const SPAposition& end,
@@ -1432,6 +1505,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result));
 		}
 
+		/// 计算线段上位于曲面体内部的参数区间（基于穿越事件追踪）
 		std::vector<Interval> exact_segment_inside_intervals_on_subsegment(
 			const SPAposition& start,
 			const SPAposition& end,
@@ -1464,6 +1538,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result));
 		}
 
+		/// 点到平面板的最短距离：检查主面投影包含性 + 侧壁三角形距离
 		double point_to_plane_panel_distance(const SPAposition& point,
 			const PlanePanelGeometry& geometry) {
 			double best_distance = std::numeric_limits<double>::infinity();
@@ -1512,11 +1587,13 @@ namespace hanfeng {
 			return best_distance;
 		}
 
+		/// 二维叉积
 		double cross_2d(const std::array<double, 2>& left,
 			const std::array<double, 2>& right) {
 			return left[0] * right[1] - left[1] * right[0];
 		}
 
+		/// 收集 UV 参数射线上与投影环各边的交点参数
 		std::vector<double> collect_path_edge_intersections(
 			const std::array<double, 2>& start,
 			const std::array<double, 2>& end,
@@ -1590,6 +1667,7 @@ namespace hanfeng {
 			return parameters;
 		}
 
+		/// 将 UV 射线与投影环的交点参数追加到列表
 		void append_path_edge_intersections(std::vector<double>& parameters,
 			const std::array<double, 2>& start,
 			const std::array<double, 2>& end,
@@ -1653,6 +1731,7 @@ namespace hanfeng {
 			}
 		}
 
+		/// 根据法向量选择最稳定的两个投影轴（取法向量分量最小的两个轴）
 		std::pair<int, int> dominant_projection_axes(const SPAvector& normal) {
 			const double abs_x = std::fabs(normal.x());
 			const double abs_y = std::fabs(normal.y());
@@ -1666,12 +1745,14 @@ namespace hanfeng {
 			return { 0, 1 };
 		}
 
+		/// 将三维点投影到指定的两个坐标轴
 		std::array<double, 2> project_to_axes(const SPAposition& point,
 			int first_axis,
 			int second_axis) {
 			return { point[first_axis], point[second_axis] };
 		}
 
+		/// 将三角形投影到两个坐标轴上构建 ProjectedLoop
 		ProjectedLoop build_projected_triangle_loop(const Triangle3& triangle,
 			int first_axis,
 			int second_axis) {
@@ -1688,6 +1769,7 @@ namespace hanfeng {
 			return loop;
 		}
 
+		/// 计算共面线段与三角形的重叠区间：投影到二维后用边交点采样+包含性测试
 		std::vector<Interval> exact_segment_triangle_coplanar_intervals(
 			const SPAposition& start,
 			const SPAposition& end,
@@ -1739,6 +1821,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result));
 		}
 
+		/// 判断 UV 点是否在面的有效域内（在外轮廓内且不在内孔内）
 		bool point_in_face_domain(const std::array<double, 2>& uv,
 			const PlaneFaceGeometry& face) {
 			bool in_outer = false;
@@ -1761,6 +1844,7 @@ namespace hanfeng {
 			return true;
 		}
 
+		/// 计算线段与平面面板主面的命中区间（带状距离 + UV 域约束）
 		std::vector<Interval> exact_segment_face_intervals(const SPAposition& start,
 			const SPAposition& end,
 			const PlaneFaceGeometry& face,
@@ -1810,11 +1894,13 @@ namespace hanfeng {
 				normalise_intervals(std::move(domain_intervals)));
 		}
 
+		/// 计算线段与平面板整体的命中区间（主面 + 侧壁三角形）
 		std::vector<Interval> exact_segment_plane_panel_intervals(const SPAposition& start,
 			const SPAposition& end,
 			const PlanePanelGeometry& geometry,
 			double tolerance);
 
+		/// 计算线段与曲面三角形的精确距离区间（基于代数不等式求解）
 		std::vector<Interval> exact_segment_surface_intervals(const SPAposition& start,
 			const SPAposition& end,
 			const SurfaceGeometry& geometry,
@@ -1835,6 +1921,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result));
 		}
 
+		/// 从平面板候选环出发，综合拓扑共面/体内/近距三种方式计算线段与曲面的焊缝区间
 		std::vector<Interval> exact_segment_surface_intervals_from_plane_candidate(
 			const SPAposition& start,
 			const SPAposition& end,
@@ -1894,6 +1981,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(weld_intervals));
 		}
 
+		/// 计算线段与平面板的命中区间（主面带状距离 + 侧壁三角形距离）
 		std::vector<Interval> exact_segment_plane_panel_intervals(const SPAposition& start,
 			const SPAposition& end,
 			const PlanePanelGeometry& geometry,
@@ -1916,6 +2004,7 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result));
 		}
 
+		/// 收集曲面板的所有候选边界环
 		std::vector<Polyline3> hanfeng_collect_surface_candidate_loops(
 			const SurfacePanel& panel) {
 			std::vector<Polyline3> loops;
@@ -1928,6 +2017,7 @@ namespace hanfeng {
 			return loops;
 		}
 
+		/// 收集平面板的所有候选边界环（含外法线方向）
 		std::vector<PlaneCandidateLoop> hanfeng_collect_plane_candidate_loops(
 			const PlanePanelGeometry& geometry) {
 			std::vector<PlaneCandidateLoop> loops;
@@ -1942,6 +2032,7 @@ namespace hanfeng {
 			return loops;
 		}
 
+		/// 追加点到焊缝折线（距离过近时跳过）
 		void hanfeng_append_point_if_needed(Polyline3& polyline,
 			const SPAposition& point,
 			double tolerance) {
@@ -1951,6 +2042,7 @@ namespace hanfeng {
 			}
 		}
 
+		/// 计算折线总长度
 		double hanfeng_polyline_length(const Polyline3& polyline) {
 			double length = 0.0;
 			for (std::size_t index = 1; index < polyline.size(); ++index) {
@@ -1959,6 +2051,7 @@ namespace hanfeng {
 			return length;
 		}
 
+		/// 裁剪候选环：在线段参数空间上查询命中区间，连接为连续焊缝折线
 		template <typename IntervalQuery>
 		std::vector<WeldPolyline> hanfeng_clip_candidate_loop(
 			const Polyline3& input_loop,
@@ -2038,6 +2131,7 @@ namespace hanfeng {
 			return result;
 		}
 
+		/// 计算点到折线的最短距离
 		double hanfeng_point_to_polyline_distance(const SPAposition& point,
 			const Polyline3& polyline) {
 			if (polyline.empty()) {
@@ -2057,6 +2151,7 @@ namespace hanfeng {
 			return std::sqrt(best_distance_squared);
 		}
 
+		/// 判断两条折线是否等价（端点匹配 + 双向逐点距离检测）
 		bool hanfeng_polylines_equivalent(const Polyline3& first,
 			const Polyline3& second,
 			double tolerance) {
@@ -2087,6 +2182,7 @@ namespace hanfeng {
 			return true;
 		}
 
+		/// 焊缝折线去重：过滤过短折线，移除方向无关的等价重复
 		std::vector<WeldPolyline> hanfeng_deduplicate_polylines(
 			const std::vector<WeldPolyline>& polylines,
 			double tolerance) {
@@ -2114,14 +2210,17 @@ namespace hanfeng {
 
 	}  // namespace
 
+	/// 重置焊缝性能分析数据为零
 	void hanfeng_reset_weld_profiling_data() {
 		g_weld_profiling_data = WeldProfilingData{};
 	}
 
+	/// 获取当前焊缝性能分析数据的副本
 	WeldProfilingData hanfeng_get_weld_profiling_data() {
 		return g_weld_profiling_data;
 	}
 
+	/// 焊缝计算主入口：构建几何 → 收集候选 → 裁剪 → 去重，全程带性能计时
 	WeldCurveResult hanfeng_compute_plane_surface_weld(
 		const PlanePanel& plane_panel,
 		const SurfacePanel& surface_panel,

@@ -1,13 +1,13 @@
 // =============================================================================
-// hanfeng_util.cpp — hanfeng 工具函数实现
+// panel.cpp — 面板模型解析与构造
 // =============================================================================
 //
-// 本文件实现了 hanfeng 项目的模型解析与几何计算工具，主要包括：
-//   1. 极简 JSON 解析器（JsonValue + JsonParser）
-//   2. 模型文件路径解析（resolve_model_json_paths）
-//   3. 平面板解析（api_get_plane_panel）
-//   4. 曲面板解析（api_get_surface）
-//   5. 面板构造与模型数据转换
+// 实现面板数据的读取与构造，主要包括：
+//   - 极简 JSON 解析器（JsonValue + JsonParser）
+//   - 模型文件路径解析
+//   - 平面板解析（api_get_plane_panel）
+//   - 曲面板解析（api_get_surface_panel / api_get_surface）
+//   - rxy 曲线展开、边界环重建等内部辅助逻辑
 // =============================================================================
 
 #include "hanfeng/panel.hpp"
@@ -665,11 +665,13 @@ namespace hanfeng {
 			return face;
 		}
 
+		/// 二维局部坐标点（rxy 曲线展开用）
 		struct LocalPoint2 {
 			double x = 0.0;
 			double y = 0.0;
 		};
 
+		/// 判断两个二维点是否在给定容差内重合
 		bool points_close_2d(const LocalPoint2& left,
 			const LocalPoint2& right,
 			double epsilon = 1.0e-6) {
@@ -677,6 +679,7 @@ namespace hanfeng {
 				std::fabs(left.y - right.y) <= epsilon;
 		}
 
+		/// 追加点到二维折线，仅在距离足够远时追加（避免重复点）
 		void append_local_point_if_needed(std::vector<LocalPoint2>& polyline,
 			const LocalPoint2& point,
 			double epsilon = 1.0e-6) {
@@ -685,6 +688,7 @@ namespace hanfeng {
 			}
 		}
 
+		/// 从原始 C 风格 float 数组解析 rxy 曲线，验证 header 与点数一致性
 		RxyCurve parse_raw_rxy_curve(const float raw_curve[1000][3], const char* label) {
 			const long long raw_count = std::llround(raw_curve[0][0]);
 			if (raw_count < 2LL || raw_count > 1000LL) {
@@ -706,6 +710,7 @@ namespace hanfeng {
 			return curve;
 		}
 
+		/// 将角度差归一化到 (-π, π] 区间
 		double normalise_angle_delta(double delta) {
 			constexpr double kLocalPi = 3.14159265358979323846;
 			while (delta <= -kLocalPi) {
@@ -717,6 +722,7 @@ namespace hanfeng {
 			return delta;
 		}
 
+		/// 根据起点、终点和有符号半径确定圆弧圆心。正半径=顺时针，负半径=逆时针
 		LocalPoint2 choose_arc_center(const LocalPoint2& start,
 			const LocalPoint2& end,
 			double signed_radius) {
@@ -756,6 +762,7 @@ namespace hanfeng {
 			throw std::runtime_error("rxy 圆弧解析失败：无法根据半径方向确定圆心。");
 		}
 
+		/// 将圆弧段离散采样后追加到二维折线（步长约 10°）
 		void append_arc_segment_samples(std::vector<LocalPoint2>& polyline,
 			const LocalPoint2& start,
 			const LocalPoint2& end,
@@ -785,6 +792,7 @@ namespace hanfeng {
 			}
 		}
 
+		/// 将 rxy 曲线展开为二维折线：直线段直接追加，圆弧段离散采样
 		std::vector<LocalPoint2> expand_rxy_curve_to_polyline(const RxyCurve& curve) {
 			std::vector<LocalPoint2> polyline;
 			polyline.reserve(curve.geometry_point_count());
@@ -811,10 +819,12 @@ namespace hanfeng {
 			return polyline;
 		}
 
+		/// 从 cAxis 数组的一行解析三维坐标点
 		SPAposition parse_caxis_position_row(const float row[3]) {
 			return SPAposition(row[0], row[1], row[2]);
 		}
 
+		/// 从 cAxis 数组的一行解析三维向量，验证其归一化有效性
 		SPAvector parse_caxis_vector_row(const float row[3], const char* label) {
 			const SPAvector vector(row[0], row[1], row[2]);
 			if (!normalise(vector).is_valid()) {
@@ -824,6 +834,7 @@ namespace hanfeng {
 			return vector;
 		}
 
+		/// 将局部二维折线变换到三维世界坐标（原点 + UV轴 + 偏移）
 		Polyline3 transform_local_polyline(const std::vector<LocalPoint2>& local_points,
 			const SPAposition& origin,
 			const SPAvector& u_axis,
@@ -839,6 +850,7 @@ namespace hanfeng {
 			return world_points;
 		}
 
+		/// 用一个外轮廓和若干内孔直接构建 PlaneFace
 		PlaneFace build_plane_face_from_loops(Polyline3 outer_loop,
 			std::vector<Polyline3> inner_loops) {
 			PlaneFace face;
@@ -847,6 +859,7 @@ namespace hanfeng {
 			return face;
 		}
 
+		/// 用两个顶点索引表示的无向边
 		struct IndexedEdge {
 			std::size_t a = 0U;
 			std::size_t b = 0U;
@@ -856,6 +869,7 @@ namespace hanfeng {
 			}
 		};
 
+		/// IndexedEdge 的哈希函数
 		struct IndexedEdgeHash {
 			std::size_t operator()(const IndexedEdge& edge) const {
 				return std::hash<std::size_t>{}(edge.a) ^
@@ -863,6 +877,7 @@ namespace hanfeng {
 			}
 		};
 
+		/// std::vector<std::size_t> 的哈希函数（用于环去重）
 		struct IndexVectorHash {
 			std::size_t operator()(const std::vector<std::size_t>& values) const {
 				std::size_t seed = 0U;
@@ -874,10 +889,12 @@ namespace hanfeng {
 			}
 		};
 
+		/// 构建规范化无向边（较小的索引在前），确保 (a,b) 和 (b,a) 得到相同的边
 		IndexedEdge canonical_indexed_edge(std::size_t first, std::size_t second) {
 			return first <= second ? IndexedEdge{ first, second } : IndexedEdge{ second, first };
 		}
 
+		/// 对邻接表中每个顶点的邻居排序并去重
 		void sort_and_unique_neighbors(
 			std::unordered_map<std::size_t, std::vector<std::size_t>>& graph) {
 			for (auto& [vertex, neighbors] : graph) {
@@ -887,6 +904,7 @@ namespace hanfeng {
 			}
 		}
 
+		/// 从边界邻接图中追踪所有独立的封闭环（按大小降序返回）
 		std::vector<std::vector<std::size_t>> trace_index_loops(
 			std::unordered_map<std::size_t, std::vector<std::size_t>> boundary_graph) {
 			sort_and_unique_neighbors(boundary_graph);
@@ -957,6 +975,7 @@ namespace hanfeng {
 			return loops;
 		}
 
+		/// 计算索引环的周长（将索引映射到实际顶点坐标）
 		double indexed_loop_perimeter(const std::vector<std::size_t>& loop,
 			const std::vector<SPAposition>& vertices) {
 			if (loop.size() < 2U) {
@@ -971,11 +990,13 @@ namespace hanfeng {
 			return perimeter;
 		}
 
+		/// 将索引环排序后作为去重用的规范键
 		std::vector<std::size_t> normalize_loop_key(std::vector<std::size_t> loop) {
 			std::sort(loop.begin(), loop.end());
 			return loop;
 		}
 
+		/// 合并拓扑边界环和特征边界环，按大小和周长降序去重排序
 		std::vector<std::vector<std::size_t>> merge_boundary_index_loops(
 			const std::vector<std::vector<std::size_t>>& topology_loops,
 			const std::vector<std::vector<std::size_t>>& feature_loops,
@@ -1011,6 +1032,7 @@ namespace hanfeng {
 			return merged;
 		}
 
+		/// 计算三角形的法向量（叉积归一化），退化三角形返回 nullopt
 		std::optional<SPAunit_vector> indexed_triangle_normal(const Triangle& triangle,
 			const std::vector<SPAposition>& vertices) {
 			if (triangle[0] >= vertices.size() || triangle[1] >= vertices.size() ||
@@ -1026,6 +1048,7 @@ namespace hanfeng {
 			return normal;
 		}
 
+		/// 基于平滑角度阈值将三角形分组为光滑区域，提取各区域的边界环
 		std::vector<std::vector<std::size_t>> smooth_region_boundary_index_loops(
 			const std::vector<SPAposition>& vertices,
 			const std::vector<Triangle>& triangles,
@@ -1154,6 +1177,7 @@ namespace hanfeng {
 			return region_loops;
 		}
 
+		/// 从三角网格重建完整边界环：提取拓扑边界 + 光滑区域特征，合并去重
 		std::vector<Polyline3> reconstruct_surface_boundary_loops(
 			const std::vector<SPAposition>& vertices,
 			const std::vector<Triangle>& triangles) {
@@ -1197,6 +1221,7 @@ namespace hanfeng {
 			return loops;
 		}
 
+		/// 将边界环列表分配到 FaceBoundaries：前 2 条为外轮廓，其余为内孔
 		void assign_surface_boundaries_from_loops(const std::vector<Polyline3>& loops,
 			FaceBoundaries& boundaries) {
 			const std::size_t outer_loop_count = std::min<std::size_t>(2U, loops.size());
@@ -1723,6 +1748,7 @@ namespace hanfeng {
 		return panel;
 	}
 
+	/// 从原始 rxy 数组和 cAxis 构造平面板（双面 + 内孔）
 	PlanePanel api_get_plane_panel(const float rxyPltBndry1[1000][3],
 		const float rxyholes[20][1000][3],
 		const float cAxis[4][3],
@@ -1788,10 +1814,7 @@ namespace hanfeng {
 		return panel;
 	}
 
-	SurfacePanel api_get_surface(const std::filesystem::path& model_path) {
-		return api_get_surface_panel(model_path);
-	}
-
+	/// 从原始三角网格数组构造曲面板，自动重建边界环
 	SurfacePanel api_get_surface_panel(const float vertices[][3],
 		int vertex_count,
 		const int triangles[][3],
