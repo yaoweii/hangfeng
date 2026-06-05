@@ -1,0 +1,47 @@
+# Build
+build/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS / IDE
+.vs/
+*.vcxproj.user
+*.suo
+*.sln
+*.vcxproj.filters
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Compiled objects
+*.obj
+*.exe
+*.o
+*.a
+*.lib
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# Model data (generated from DXF, large)
+model/
+
+# Result output (regeneratable)
+result/
+
+# Office temp files
+~$*
+
+# Claude Code
+.claude/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
