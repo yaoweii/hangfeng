@@ -1,5 +1,23 @@
 # History Index
 
+## 2026-06-13 FB03C 焊缝导出与平面板分组修复
+**文件**: [2026-06-13-fb03c-weld-export-plane-grouping-fix.md](2026-06-13-fb03c-weld-export-plane-grouping-fix.md)
+
+基于新的 `FB03C.dxf` 重新生成 `model/`，将真实模型焊缝 HTML/JSON 导出改为只输出存在焊缝的组合；修复焊缝 polyline 端点在容差内相接但未合并的问题；进一步定位并修复 7 个轴对齐平面板因拟合法向微小偏斜导致 `same_plane_group()` 误分成 4 组的问题。修复后可测试平面板从 186 个恢复为 193 个，可测试组合从 15810 增加到 16405，有焊缝导出组合从 270 增加到 287。
+**关键词**: FB03C, 焊缝导出, HTML过滤, 端点合并, same_plane_group, 平面板分组, 轴对齐平面, model更新
+
+---
+
+## 2026-06-13 焊缝折线转 rxyz 样条后处理
+
+**文件**: [2026-06-13-weld-rxyz-spline-postprocess.md](2026-06-13-weld-rxyz-spline-postprocess.md)
+
+在焊缝检测和去重完成后，新增 `hanfeng_fit_weld_splines()` 将每条焊缝折线后处理为 `rxyz` 样条，并为每条焊缝输出一组 `reference_point` 和 `tangent_direction`。真实模型导出结果同步追加 `points_rxyz`、`reference_point`、`tangent_direction` 字段。
+
+**关键词**: 焊缝后处理, rxyz, 样条拟合, 圆弧恢复, 切线方向, WeldSpline
+
+---
+
 所有历史工作文档索引，按日期倒序排列。查找历史工作时先看本文件。
 
 ---

@@ -21,6 +21,17 @@ namespace hanfeng {
 		std::vector<WeldPolyline> polylines;
 	};
 
+	struct WeldSpline {
+		Polyline3 raw_points;
+		RxyzCurve points_rxyz;
+		SPAposition reference_point;
+		SPAunit_vector tangent_direction;
+	};
+
+	struct WeldSplineResult {
+		std::vector<WeldSpline> welds;
+	};
+
 }  // namespace hanfeng
 
 #endif

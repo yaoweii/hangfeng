@@ -2208,6 +2208,404 @@ namespace hanfeng {
 			return unique_polylines;
 		}
 
+		bool hanfeng_points_touch(const SPAposition& first,
+			const SPAposition& second,
+			double tolerance) {
+			return (first - second).len() <= tolerance;
+		}
+
+		Polyline3 hanfeng_oriented_polyline(const Polyline3& polyline,
+			bool reverse) {
+			if (!reverse) {
+				return polyline;
+			}
+			return Polyline3(polyline.rbegin(), polyline.rend());
+		}
+
+		bool hanfeng_try_merge_touching_polylines(WeldPolyline& target,
+			const WeldPolyline& candidate,
+			double tolerance) {
+			if (target.points.size() < 2U || candidate.points.size() < 2U) {
+				return false;
+			}
+
+			const bool target_back_to_candidate_front =
+				hanfeng_points_touch(target.points.back(), candidate.points.front(), tolerance);
+			const bool target_back_to_candidate_back =
+				hanfeng_points_touch(target.points.back(), candidate.points.back(), tolerance);
+			const bool candidate_back_to_target_front =
+				hanfeng_points_touch(candidate.points.back(), target.points.front(), tolerance);
+			const bool candidate_front_to_target_front =
+				hanfeng_points_touch(candidate.points.front(), target.points.front(), tolerance);
+
+			if (target_back_to_candidate_front || target_back_to_candidate_back) {
+				const Polyline3 source =
+					hanfeng_oriented_polyline(candidate.points, target_back_to_candidate_back);
+				target.points.insert(target.points.end(), source.begin() + 1, source.end());
+				return true;
+			}
+
+			if (candidate_back_to_target_front || candidate_front_to_target_front) {
+				const Polyline3 source =
+					hanfeng_oriented_polyline(candidate.points, candidate_front_to_target_front);
+				Polyline3 merged = source;
+				merged.insert(merged.end(), target.points.begin() + 1, target.points.end());
+				target.points = std::move(merged);
+				return true;
+			}
+
+			return false;
+		}
+
+		std::vector<WeldPolyline> hanfeng_merge_touching_polylines(
+			std::vector<WeldPolyline> polylines,
+			double tolerance) {
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (std::size_t i = 0; i < polylines.size() && !changed; ++i) {
+					for (std::size_t j = i + 1U; j < polylines.size(); ++j) {
+						if (hanfeng_try_merge_touching_polylines(
+							polylines[i], polylines[j], tolerance)) {
+							polylines.erase(polylines.begin() + static_cast<std::ptrdiff_t>(j));
+							changed = true;
+							break;
+						}
+					}
+				}
+			}
+			return polylines;
+		}
+
+		struct FittedWeldSegment {
+			std::size_t start_index = 0;
+			std::size_t end_index = 0;
+			bool is_arc = false;
+			double signed_radius = 0.0;
+			SPAposition center;
+			SPAunit_vector u_axis;
+			SPAunit_vector v_axis;
+			double start_angle = 0.0;
+			double total_angle = 0.0;
+		};
+
+		std::vector<SPAposition> dedupe_weld_points(const Polyline3& points,
+			double tolerance) {
+			std::vector<SPAposition> cleaned;
+			for (const SPAposition& point : points) {
+				if (cleaned.empty() || (point - cleaned.back()).len() > tolerance) {
+					cleaned.push_back(point);
+				}
+			}
+			return cleaned;
+		}
+
+		double point_to_line_distance(const SPAposition& point,
+			const SPAposition& start,
+			const SPAposition& end) {
+			const SPAvector segment = end - start;
+			const double length_sq = segment.len_sq();
+			if (length_sq <= 1.0e-18) {
+				return (point - start).len();
+			}
+			const double t = ((point - start) % segment) / length_sq;
+			const SPAposition projected = start + segment * t;
+			return (point - projected).len();
+		}
+
+		bool fit_line_segment(const std::vector<SPAposition>& points,
+			std::size_t start_index,
+			std::size_t end_index,
+			double tolerance,
+			FittedWeldSegment& segment) {
+			if (end_index <= start_index) {
+				return false;
+			}
+
+			const SPAposition& start = points[start_index];
+			const SPAposition& end = points[end_index];
+			if ((end - start).len() <= tolerance) {
+				return false;
+			}
+
+			for (std::size_t index = start_index + 1U; index < end_index; ++index) {
+				if (point_to_line_distance(points[index], start, end) > tolerance) {
+					return false;
+				}
+			}
+
+			segment = FittedWeldSegment{};
+			segment.start_index = start_index;
+			segment.end_index = end_index;
+			return true;
+		}
+
+		bool solve_circle_2d(double x1,
+			double y1,
+			double x2,
+			double y2,
+			double x3,
+			double y3,
+			double& center_x,
+			double& center_y) {
+			const double determinant =
+				2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+			if (std::fabs(determinant) <= 1.0e-12) {
+				return false;
+			}
+
+			const double p1 = x1 * x1 + y1 * y1;
+			const double p2 = x2 * x2 + y2 * y2;
+			const double p3 = x3 * x3 + y3 * y3;
+			center_x =
+				(p1 * (y2 - y3) + p2 * (y3 - y1) + p3 * (y1 - y2)) /
+				determinant;
+			center_y =
+				(p1 * (x3 - x2) + p2 * (x1 - x3) + p3 * (x2 - x1)) /
+				determinant;
+			return true;
+		}
+
+		double normalize_angle_delta(double delta) {
+			constexpr double pi = 3.14159265358979323846;
+			while (delta <= -pi) {
+				delta += 2.0 * pi;
+			}
+			while (delta > pi) {
+				delta -= 2.0 * pi;
+			}
+			return delta;
+		}
+
+		bool fit_arc_segment(const std::vector<SPAposition>& points,
+			std::size_t start_index,
+			std::size_t end_index,
+			double tolerance,
+			FittedWeldSegment& segment) {
+			if (end_index < start_index + 3U) {
+				return false;
+			}
+
+			const SPAposition& start = points[start_index];
+			const SPAposition& end = points[end_index];
+			const SPAvector chord = end - start;
+			if (chord.len() <= tolerance) {
+				return false;
+			}
+
+			SPAvector normal_vector;
+			for (std::size_t index = start_index + 1U; index < end_index; ++index) {
+				normal_vector = (points[index] - start) * chord;
+				if (normal_vector.len() > tolerance * chord.len()) {
+					break;
+				}
+			}
+			const SPAunit_vector normal = normalise(normal_vector);
+			if (!normal.is_valid()) {
+				return false;
+			}
+
+			const SPAunit_vector u_axis = normalise(chord);
+			const SPAunit_vector v_axis = normalise(normal * u_axis);
+			if (!v_axis.is_valid()) {
+				return false;
+			}
+
+			std::vector<std::array<double, 2>> projected;
+			projected.reserve(end_index - start_index + 1U);
+			for (std::size_t index = start_index; index <= end_index; ++index) {
+				const SPAvector offset = points[index] - start;
+				const double plane_distance = std::fabs(offset % normal);
+				if (plane_distance > tolerance) {
+					return false;
+				}
+				projected.push_back({ offset % u_axis, offset % v_axis });
+			}
+
+			const std::size_t mid_offset = projected.size() / 2U;
+			double center_x = 0.0;
+			double center_y = 0.0;
+			if (!solve_circle_2d(projected.front()[0], projected.front()[1],
+				projected[mid_offset][0], projected[mid_offset][1],
+				projected.back()[0], projected.back()[1], center_x, center_y)) {
+				return false;
+			}
+
+			const double radius = std::hypot(
+				projected.front()[0] - center_x, projected.front()[1] - center_y);
+			if (radius <= tolerance) {
+				return false;
+			}
+
+			std::vector<double> angles;
+			angles.reserve(projected.size());
+			double previous_raw_angle = 0.0;
+			for (const std::array<double, 2>& point : projected) {
+				const double radial_error =
+					std::fabs(std::hypot(point[0] - center_x, point[1] - center_y) - radius);
+				if (radial_error > tolerance) {
+					return false;
+				}
+				const double angle = std::atan2(point[1] - center_y, point[0] - center_x);
+				if (angles.empty()) {
+					angles.push_back(angle);
+				}
+				else {
+					angles.push_back(
+						angles.back() + normalize_angle_delta(angle - previous_raw_angle));
+				}
+				previous_raw_angle = angle;
+			}
+
+			const double total_angle = angles.back() - angles.front();
+			const double angle_span = std::fabs(total_angle);
+			constexpr double pi = 3.14159265358979323846;
+			constexpr double max_sample_angle = 12.0 * pi / 180.0;
+			if (angle_span <= 1.0e-6 || angle_span > pi + 1.0e-6) {
+				return false;
+			}
+
+			const int direction = total_angle > 0.0 ? 1 : -1;
+			for (std::size_t index = 1U; index < angles.size(); ++index) {
+				const double delta = angles[index] - angles[index - 1U];
+				if ((delta > 0.0 ? 1 : -1) != direction ||
+					std::fabs(delta) > max_sample_angle) {
+					return false;
+				}
+			}
+
+			segment = FittedWeldSegment{};
+			segment.start_index = start_index;
+			segment.end_index = end_index;
+			segment.is_arc = true;
+			segment.signed_radius = total_angle < 0.0 ? radius : -radius;
+			segment.center = start + u_axis.vector() * center_x + v_axis.vector() * center_y;
+			segment.u_axis = u_axis;
+			segment.v_axis = v_axis;
+			segment.start_angle = angles.front();
+			segment.total_angle = total_angle;
+			return true;
+		}
+
+		FittedWeldSegment select_next_weld_segment(
+			const std::vector<SPAposition>& points,
+			std::size_t start_index,
+			double tolerance) {
+			FittedWeldSegment best_arc;
+			bool has_arc = false;
+			for (std::size_t end_index = points.size() - 1U;
+				end_index >= start_index + 3U; --end_index) {
+				if (fit_arc_segment(points, start_index, end_index, tolerance, best_arc)) {
+					has_arc = true;
+					break;
+				}
+				if (end_index == start_index + 3U) {
+					break;
+				}
+			}
+
+			FittedWeldSegment best_line;
+			bool has_line = false;
+			for (std::size_t end_index = points.size() - 1U;
+				end_index >= start_index + 1U; --end_index) {
+				if (fit_line_segment(points, start_index, end_index, tolerance, best_line)) {
+					has_line = true;
+					break;
+				}
+				if (end_index == start_index + 1U) {
+					break;
+				}
+			}
+
+			if (has_arc &&
+				(!has_line || best_arc.end_index - start_index >= best_line.end_index - start_index)) {
+				return best_arc;
+			}
+			if (has_line) {
+				return best_line;
+			}
+
+			FittedWeldSegment fallback;
+			fallback.start_index = start_index;
+			fallback.end_index = std::min(start_index + 1U, points.size() - 1U);
+			return fallback;
+		}
+
+		RxyzCurve build_weld_rxyz_curve(const std::vector<SPAposition>& points,
+			const std::vector<FittedWeldSegment>& segments) {
+			RxyzCurve curve;
+			if (points.empty()) {
+				return curve;
+			}
+
+			curve.points.reserve(segments.size() + 2U);
+			curve.points.push_back(RxyzPoint{ 0.0, 0.0, 0.0, 0.0 });
+			for (const FittedWeldSegment& segment : segments) {
+				const SPAposition& start = points[segment.start_index];
+				curve.points.push_back(RxyzPoint{
+					segment.is_arc ? segment.signed_radius : 0.0,
+					start.x(), start.y(), start.z() });
+			}
+			const SPAposition& end = points[segments.empty() ? 0U : segments.back().end_index];
+			curve.points.push_back(RxyzPoint{ 0.0, end.x(), end.y(), end.z() });
+			curve.points.front().r = static_cast<double>(curve.points.size());
+			return curve;
+		}
+
+		SPAunit_vector tangent_from_first_segment(const std::vector<SPAposition>& points,
+			const FittedWeldSegment& segment) {
+			if (!segment.is_arc) {
+				return normalise(points[segment.end_index] - points[segment.start_index]);
+			}
+
+			const double sin_angle = std::sin(segment.start_angle);
+			const double cos_angle = std::cos(segment.start_angle);
+			SPAvector tangent =
+				segment.u_axis.vector() * (-sin_angle) +
+				segment.v_axis.vector() * cos_angle;
+			if (segment.total_angle < 0.0) {
+				tangent = -tangent;
+			}
+			return normalise(tangent);
+		}
+
+		WeldSpline fit_single_weld_spline(const WeldPolyline& polyline,
+			double tolerance) {
+			const std::vector<SPAposition> points =
+				dedupe_weld_points(polyline.points, tolerance * 0.1);
+
+			WeldSpline spline;
+			spline.raw_points = points;
+			if (points.empty()) {
+				spline.points_rxyz.points.push_back(RxyzPoint{ 1.0, 0.0, 0.0, 0.0 });
+				return spline;
+			}
+
+			spline.reference_point = points.front();
+			if (points.size() == 1U) {
+				spline.points_rxyz.points.push_back(RxyzPoint{ 2.0, 0.0, 0.0, 0.0 });
+				spline.points_rxyz.points.push_back(RxyzPoint{
+					0.0, points.front().x(), points.front().y(), points.front().z() });
+				return spline;
+			}
+
+			std::vector<FittedWeldSegment> segments;
+			std::size_t start_index = 0;
+			while (start_index + 1U < points.size()) {
+				FittedWeldSegment segment =
+					select_next_weld_segment(points, start_index, tolerance);
+				if (segment.end_index <= start_index) {
+					break;
+				}
+				segments.push_back(segment);
+				start_index = segment.end_index;
+			}
+
+			spline.points_rxyz = build_weld_rxyz_curve(points, segments);
+			spline.tangent_direction = tangent_from_first_segment(points, segments.front());
+			return spline;
+		}
+
 	}  // namespace
 
 	/// 重置焊缝性能分析数据为零
@@ -2218,6 +2616,17 @@ namespace hanfeng {
 	/// 获取当前焊缝性能分析数据的副本
 	WeldProfilingData hanfeng_get_weld_profiling_data() {
 		return g_weld_profiling_data;
+	}
+
+	WeldSplineResult hanfeng_fit_weld_splines(
+		const WeldCurveResult& weld_result,
+		double tolerance) {
+		WeldSplineResult result;
+		result.welds.reserve(weld_result.polylines.size());
+		for (const WeldPolyline& polyline : weld_result.polylines) {
+			result.welds.push_back(fit_single_weld_spline(polyline, tolerance));
+		}
+		return result;
 	}
 
 	/// 焊缝计算主入口：构建几何 → 收集候选 → 裁剪 → 去重，全程带性能计时
@@ -2301,8 +2710,11 @@ namespace hanfeng {
 		WeldCurveResult result;
 		{
 			ScopedDurationAccumulator timer(g_weld_profiling_data.deduplicate_ms);
-			result.polylines =
-				hanfeng_deduplicate_polylines(all_polylines, tolerance);
+			result.polylines = hanfeng_deduplicate_polylines(
+				hanfeng_merge_touching_polylines(
+					hanfeng_deduplicate_polylines(all_polylines, tolerance),
+					tolerance),
+				tolerance);
 		}
 		g_weld_profiling_data.total_ms = std::chrono::duration<double, std::milli>(
 			ProfilingClock::now() - total_start).count();

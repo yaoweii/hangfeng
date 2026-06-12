@@ -304,6 +304,7 @@ namespace hanfeng {
 		struct PlaneLoopInfo {
 			Polyline3 loop;                 ///< 原始边界环点序列
 			SPAposition origin;             ///< 拟合平面原点
+			SPAposition centroid;           ///< 边界环质心，用于稳定分组
 			SPAunit_vector normal;          ///< 拟合平面法向量
 			double plane_offset = 0.0;      ///< 环质心沿法向量偏移量
 			double area_magnitude = 0.0;    ///< 环的有向面积绝对值
@@ -312,6 +313,7 @@ namespace hanfeng {
 		/// @brief 一组共面边界环
 		struct LoopGroup {
 			SPAposition origin;
+			SPAposition centroid;
 			SPAunit_vector normal;
 			double plane_offset = 0.0;
 			std::vector<PlaneLoopInfo> loops;
@@ -570,6 +572,34 @@ namespace hanfeng {
 			return (point - SPAposition()) % normal;
 		}
 
+		int dominant_axis_index(const SPAunit_vector& normal) {
+			const double x = std::fabs(normal.x());
+			const double y = std::fabs(normal.y());
+			const double z = std::fabs(normal.z());
+			if (x >= y && x >= z) {
+				return 0;
+			}
+			if (y >= z) {
+				return 1;
+			}
+			return 2;
+		}
+
+		double coordinate_at_axis(const SPAposition& point, int axis_index) {
+			if (axis_index == 0) {
+				return point.x();
+			}
+			if (axis_index == 1) {
+				return point.y();
+			}
+			return point.z();
+		}
+
+		bool normal_is_axis_aligned(const SPAunit_vector& normal, int axis_index) {
+			return std::fabs(coordinate_at_axis(
+				SPAposition(normal.x(), normal.y(), normal.z()), axis_index)) >= 0.999;
+		}
+
 		/// 根据法向量构建平面正交基 (u, v)
 		std::pair<SPAunit_vector, SPAunit_vector> build_plane_basis(
 			const SPAunit_vector& normal) {
@@ -631,6 +661,7 @@ namespace hanfeng {
 			PlaneLoopInfo info;
 			info.loop = loop;
 			info.origin = origin;
+			info.centroid = centroid;
 			info.normal = normal;
 			info.plane_offset = point_offset_along_normal(centroid, normal);
 			info.area_magnitude = compute_loop_area_magnitude(loop, origin, normal);
@@ -645,7 +676,21 @@ namespace hanfeng {
 			}
 			// 法向量反方向时 offset 符号相反，需要校正后再比较
 			const double sign = cosine >= 0.0 ? 1.0 : -1.0;
-			return std::fabs(loop.plane_offset * sign - group.plane_offset) <= 1.0e-3;
+			if (std::fabs(loop.plane_offset * sign - group.plane_offset) <= 1.0e-3) {
+				return true;
+			}
+
+			const int loop_axis = dominant_axis_index(loop.normal);
+			const int group_axis = dominant_axis_index(group.normal);
+			if (loop_axis != group_axis ||
+				!normal_is_axis_aligned(loop.normal, loop_axis) ||
+				!normal_is_axis_aligned(group.normal, group_axis)) {
+				return false;
+			}
+
+			return std::fabs(
+				coordinate_at_axis(loop.centroid, loop_axis) -
+				coordinate_at_axis(group.centroid, group_axis)) <= 1.0e-2;
 		}
 
 		/// 将共面组构建为 PlaneFace（面积最大为外轮廓，其余为内孔）
@@ -1719,6 +1764,7 @@ namespace hanfeng {
 			if (!assigned) {
 				LoopGroup group;
 				group.origin = info.origin;
+				group.centroid = info.centroid;
 				group.normal = info.normal;
 				group.plane_offset = info.plane_offset;
 				group.loops.push_back(info);

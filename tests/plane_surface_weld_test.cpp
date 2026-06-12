@@ -5,7 +5,7 @@
 // 测试覆盖：
 //   - 合成数据：曲面板边界靠近平面面的焊缝检测
 //   - 合成数据：平面板边界在曲面板内部的焊缝检测
-//   - 真实模型：2 平面板 × 6 曲面板 = 12 组焊缝计算，含计时与结果导出
+//   - 真实模型：平面板 × 曲面板全组合焊缝计算，仅导出存在焊缝的组合
 //
 // PLANE_SURFACE_TEST 宏控制：
 //   定义时，test_main.cpp 只调用 test_weld_with_real_models_and_export()
@@ -13,6 +13,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -347,6 +348,20 @@ namespace {
 		std::string name;
 		std::string category;
 		std::string directory;
+	};
+
+	struct LoadedPlaneEntry {
+		PanelEntry entry;
+		hanfeng::PlanePanel panel;
+		hanfeng::SurfacePanel mesh;
+		double load_panel_ms = 0.0;
+		double load_mesh_ms = 0.0;
+	};
+
+	struct LoadedSurfaceEntry {
+		PanelEntry entry;
+		hanfeng::SurfacePanel panel;
+		double load_panel_ms = 0.0;
 	};
 
 	std::string extract_json_string(const std::string& json, const std::string& key) {
@@ -1021,6 +1036,51 @@ window.addEventListener('resize', () => { if (DATA) renderCurrent(); });
 // 合成数据测试
 // =============================================================================
 
+void test_hanfeng_fit_weld_splines_converts_line_and_arc_polylines() {
+	hanfeng::WeldCurveResult weld_result{};
+	weld_result.polylines.push_back(hanfeng::WeldPolyline{ {
+		hanfeng::SPAposition(0.0, 0.0, 0.0),
+		hanfeng::SPAposition(5.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 0.0, 0.0),
+	} });
+
+	hanfeng::Polyline3 arc_points;
+	constexpr double pi = 3.14159265358979323846;
+	for (int degrees = 0; degrees <= 90; degrees += 10) {
+		const double angle = static_cast<double>(degrees) * pi / 180.0;
+		arc_points.emplace_back(10.0 * std::cos(angle), 10.0 * std::sin(angle), 0.0);
+	}
+	weld_result.polylines.push_back(hanfeng::WeldPolyline{ arc_points });
+
+	const hanfeng::WeldSplineResult splines =
+		hanfeng::hanfeng_fit_weld_splines(weld_result, 1.0e-3);
+
+	assert(splines.welds.size() == 2U);
+
+	const hanfeng::WeldSpline& line = splines.welds[0];
+	assert(line.raw_points.size() == 3U);
+	assert(line.points_rxyz.header_matches_point_count());
+	assert(line.points_rxyz.geometry_point_count() == 2U);
+	assert(line.points_rxyz.points[1].defines_line_to_next());
+	assert(nearly_equal(line.reference_point.x(), 0.0));
+	assert(nearly_equal(line.reference_point.y(), 0.0));
+	assert(nearly_equal(line.tangent_direction.x(), 1.0));
+	assert(nearly_equal(line.tangent_direction.y(), 0.0));
+	assert(nearly_equal(line.tangent_direction.z(), 0.0));
+
+	const hanfeng::WeldSpline& arc = splines.welds[1];
+	assert(arc.raw_points.size() == 10U);
+	assert(arc.points_rxyz.header_matches_point_count());
+	assert(arc.points_rxyz.geometry_point_count() == 2U);
+	assert(arc.points_rxyz.points[1].defines_arc_to_next());
+	assert(nearly_equal(std::fabs(arc.points_rxyz.points[1].r), 10.0, 1.0e-3));
+	assert(nearly_equal(arc.reference_point.x(), 10.0));
+	assert(nearly_equal(arc.reference_point.y(), 0.0));
+	assert(nearly_equal(arc.tangent_direction.x(), 0.0, 1.0e-3));
+	assert(nearly_equal(arc.tangent_direction.y(), 1.0, 1.0e-3));
+	assert(nearly_equal(arc.tangent_direction.z(), 0.0, 1.0e-3));
+}
+
 void test_api_get_plane_surface_weld_detects_surface_boundary_on_plane_face() {
 	const hanfeng::PlanePanel plane_panel = make_plane_panel_for_face_hit();
 	const hanfeng::SurfacePanel surface_panel =
@@ -1173,6 +1233,43 @@ void test_api_get_plane_surface_weld_detects_plane_boundary_near_surface_exterio
 	assert(found_plane_loop);
 }
 
+void test_compute_plane_surface_weld_merges_touching_weld_polylines() {
+	const hanfeng::PlanePanel plane_panel = make_plane_panel_for_face_hit();
+
+	const hanfeng::SPAposition a(1.0, 2.0, 0.0);
+	const hanfeng::SPAposition b(5.0, 2.0, 0.0);
+	const hanfeng::SPAposition c(9.0, 2.0, 0.0);
+	const hanfeng::SPAposition a_top(1.0, 2.0, 4.0);
+	const hanfeng::SPAposition b_top(5.0, 2.0, 4.0);
+	const hanfeng::SPAposition c_top(9.0, 2.0, 4.0);
+
+	hanfeng::SurfacePanel surface_panel;
+	hanfeng::SurfacePatch first_patch;
+	first_patch.boundaries.outer_loops.push_back({ a, b, b_top, a_top });
+	surface_panel.surfaces.push_back(first_patch);
+
+	hanfeng::SurfacePatch second_patch;
+	second_patch.boundaries.outer_loops.push_back({ b, c, c_top, b_top });
+	surface_panel.surfaces.push_back(second_patch);
+
+	const hanfeng::WeldCurveResult result =
+		hanfeng::hanfeng_compute_plane_surface_weld(
+			plane_panel, surface_panel, 0.0);
+
+	assert(result.polylines.size() == 1U);
+	const hanfeng::WeldPolyline& merged = result.polylines.front();
+	assert(merged.points.size() == 3U);
+	const bool forward =
+		merged.points.front() == a &&
+		merged.points[1] == b &&
+		merged.points.back() == c;
+	const bool reversed =
+		merged.points.front() == c &&
+		merged.points[1] == b &&
+		merged.points.back() == a;
+	assert(forward || reversed);
+}
+
 // =============================================================================
 // 真实模型焊缝测试：12 组组合，带计时与结果导出
 // =============================================================================
@@ -1208,46 +1305,92 @@ void test_weld_with_real_models_and_export() {
 	std::cout << "曲面板数量: " << surface_entries.size() << "\n";
 	std::cout << "总组合数: " << (plane_entries.size() * surface_entries.size()) << "\n\n";
 
+	std::vector<LoadedPlaneEntry> loaded_planes;
+	loaded_planes.reserve(plane_entries.size());
+	for (const PanelEntry& plane_entry : plane_entries) {
+		LoadedPlaneEntry loaded;
+		loaded.entry = plane_entry;
+
+		auto t0 = clock::now();
+		try {
+			loaded.panel = hanfeng::api_get_plane_panel(plane_entry.directory);
+		}
+		catch (const std::exception& ex) {
+			std::cerr << "ERROR loading plane: " << plane_entry.name
+				<< ": " << ex.what() << "\n";
+			continue;
+		}
+		auto t1 = clock::now();
+
+		try {
+			loaded.mesh = hanfeng::api_get_surface_panel(plane_entry.directory);
+		}
+		catch (const std::exception& ex) {
+			std::cerr << "WARN loading plane mesh: " << plane_entry.name
+				<< ": " << ex.what() << "\n";
+		}
+		auto t2 = clock::now();
+
+		loaded.load_panel_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+		loaded.load_mesh_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+		loaded_planes.push_back(std::move(loaded));
+	}
+
+	std::vector<LoadedSurfaceEntry> loaded_surfaces;
+	loaded_surfaces.reserve(surface_entries.size());
+	for (const PanelEntry& surface_entry : surface_entries) {
+		LoadedSurfaceEntry loaded;
+		loaded.entry = surface_entry;
+
+		auto t0 = clock::now();
+		try {
+			loaded.panel = hanfeng::api_get_surface_panel(surface_entry.directory);
+		}
+		catch (const std::exception& ex) {
+			std::cerr << "ERROR loading surface: " << surface_entry.name
+				<< ": " << ex.what() << "\n";
+			continue;
+		}
+		auto t1 = clock::now();
+
+		loaded.load_panel_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+		loaded_surfaces.push_back(std::move(loaded));
+	}
+
+	const std::size_t total_combination_count =
+		loaded_planes.size() * loaded_surfaces.size();
+	std::cout << "可测试平面板数量: " << loaded_planes.size() << "\n";
+	std::cout << "可测试曲面板数量: " << loaded_surfaces.size() << "\n";
+	std::cout << "可测试组合数: " << total_combination_count << "\n\n";
+
 	// 遍历所有组合
 	std::ostringstream json_content;
 	json_content << "{\n";
 	json_content << "  \"tolerance\": 1.0,\n";
-	json_content << "  \"combination_count\": " << (plane_entries.size() * surface_entries.size()) << ",\n";
+	json_content << "  \"weld_fit_tolerance\": 0.001,\n";
+	json_content << "  \"combination_count\": " << total_combination_count << ",\n";
 	json_content << "  \"combinations\": [\n";
 
 	bool first_combo = true;
 	int combo_idx = 0;
+	int exported_combo_idx = 0;
 
-	for (const auto& plane_entry : plane_entries) {
-		for (const auto& surface_entry : surface_entries) {
+	for (const auto& plane_loaded : loaded_planes) {
+		for (const auto& surface_loaded : loaded_surfaces) {
 			++combo_idx;
+			if (combo_idx == 1 || combo_idx % 100 == 0) {
+				std::cout << "[" << combo_idx << "/" << total_combination_count
+					<< "] 已测试，当前有焊缝组合: " << exported_combo_idx << "\n";
+			}
+
+			const PanelEntry& plane_entry = plane_loaded.entry;
+			const PanelEntry& surface_entry = surface_loaded.entry;
+			const hanfeng::PlanePanel& plane_panel = plane_loaded.panel;
+			const hanfeng::SurfacePanel& surface_panel = surface_loaded.panel;
 			const std::string combo_label =
 				plane_entry.name + " x " + surface_entry.name;
-			std::cout << "[" << combo_idx << "] " << combo_label << "\n";
 
 			auto combo_start = clock::now();
-
-			// 加载平面板
-			auto t0 = clock::now();
-			hanfeng::PlanePanel plane_panel;
-			try {
-				plane_panel = hanfeng::api_get_plane_panel(plane_entry.directory);
-			}
-			catch (const std::exception& ex) {
-				std::cerr << "  ERROR loading plane: " << ex.what() << "\n";
-				continue;
-			}
-			auto t1 = clock::now();
-
-			// 加载曲面板
-			hanfeng::SurfacePanel surface_panel;
-			try {
-				surface_panel = hanfeng::api_get_surface_panel(surface_entry.directory);
-			}
-			catch (const std::exception& ex) {
-				std::cerr << "  ERROR loading surface: " << ex.what() << "\n";
-				continue;
-			}
 			auto t2 = clock::now();
 
 			// 计算焊缝
@@ -1264,14 +1407,27 @@ void test_weld_with_real_models_and_export() {
 				hanfeng::hanfeng_get_weld_profiling_data();
 			auto t3 = clock::now();
 
+			if (weld_result.polylines.empty()) {
+				continue;
+			}
+
+			const hanfeng::WeldSplineResult weld_splines =
+				hanfeng::hanfeng_fit_weld_splines(weld_result, 1.0e-3);
+			auto t4 = clock::now();
+
 			auto combo_end = clock::now();
-			double ms_load_plane = std::chrono::duration<double, std::milli>(t1 - t0).count();
-			double ms_load_surface = std::chrono::duration<double, std::milli>(t2 - t1).count();
+			double ms_load_plane = plane_loaded.load_panel_ms + plane_loaded.load_mesh_ms;
+			double ms_load_surface = surface_loaded.load_panel_ms;
 			double ms_compute_weld = std::chrono::duration<double, std::milli>(t3 - t2).count();
+			double ms_fit_weld = std::chrono::duration<double, std::milli>(t4 - t3).count();
 			double ms_total = std::chrono::duration<double, std::milli>(combo_end - combo_start).count();
 
-			std::cout << "  加载平面板: " << ms_load_plane << " ms\n";
-			std::cout << "  加载曲面板: " << ms_load_surface << " ms\n";
+			++exported_combo_idx;
+			std::cout << "[" << combo_idx << "/" << total_combination_count
+				<< "] " << combo_label << "\n";
+			std::cout << "  命中焊缝组合序号: " << exported_combo_idx << "\n";
+			std::cout << "  预加载平面板: " << ms_load_plane << " ms\n";
+			std::cout << "  预加载曲面板: " << ms_load_surface << " ms\n";
 			std::cout << "  计算焊缝:   " << ms_compute_weld << " ms\n";
 			std::cout << "  总耗时:     " << ms_total << " ms\n";
 			std::cout << "  焊缝段数:   " << weld_result.polylines.size() << "\n";
@@ -1279,6 +1435,7 @@ void test_weld_with_real_models_and_export() {
 				<< profiling.total_ms << " / "
 				<< (profiling.build_plane_geometry_ms + profiling.build_surface_geometry_ms)
 				<< " / " << profiling.clip_plane_candidates_ms << " ms\n";
+			std::cout << "  rxyz fit:     " << ms_fit_weld << " ms\n";
 			std::cout << "  Profiling(topo/inside/near): "
 				<< profiling.topo_coplanar_ms << " / "
 				<< profiling.inside_ms << " / "
@@ -1309,6 +1466,7 @@ void test_weld_with_real_models_and_export() {
 			json_content << "        \"polylines\": [\n";
 			for (std::size_t wi = 0; wi < weld_result.polylines.size(); ++wi) {
 				const auto& pl = weld_result.polylines[wi];
+				const auto& spline = weld_splines.welds[wi];
 				json_content << "          {\"index\": " << wi
 					<< ", \"point_count\": " << pl.points.size() << ",\n";
 				json_content << "           \"points\": ";
@@ -1322,7 +1480,26 @@ void test_weld_with_real_models_and_export() {
 					if (pi + 1 < pl.points.size()) json_content << ",";
 					json_content << "\n";
 				}
-				json_content << "          ]}\n";
+				json_content << "          ],\n";
+				json_content << "           \"points_rxyz\": [\n";
+				for (std::size_t ri = 0; ri < spline.points_rxyz.points.size(); ++ri) {
+					const auto& point = spline.points_rxyz.points[ri];
+					json_content << "            [" << point.r << ", "
+						<< point.x << ", "
+						<< point.y << ", "
+						<< point.z << "]";
+					if (ri + 1 < spline.points_rxyz.points.size()) json_content << ",";
+					json_content << "\n";
+				}
+				json_content << "          ],\n";
+				json_content << "           \"reference_point\": ["
+					<< spline.reference_point.x() << ", "
+					<< spline.reference_point.y() << ", "
+					<< spline.reference_point.z() << "],\n";
+				json_content << "           \"tangent_direction\": ["
+					<< spline.tangent_direction.x() << ", "
+					<< spline.tangent_direction.y() << ", "
+					<< spline.tangent_direction.z() << "]}\n";
 				if (wi + 1 < weld_result.polylines.size()) json_content << ",";
 			}
 			json_content << "        ]\n";
@@ -1330,11 +1507,7 @@ void test_weld_with_real_models_and_export() {
 
 			// 平面板几何（mesh + 边界）
 			{
-				hanfeng::SurfacePanel plane_mesh;
-				try { plane_mesh = hanfeng::api_get_surface_panel(plane_entry.directory); }
-				catch (const std::exception& ex) {
-					std::cerr << "  WARN plane mesh: " << ex.what() << "\n";
-				}
+				const hanfeng::SurfacePanel& plane_mesh = plane_loaded.mesh;
 				std::vector<std::array<double, 3>> pv;
 				std::vector<std::array<std::size_t, 3>> ptt;
 				for (const auto& patch : plane_mesh.surfaces) {
@@ -1509,7 +1682,11 @@ void test_weld_with_real_models_and_export() {
 		}
 	}
 
-	json_content << "\n  ]\n}\n";
+	json_content << "\n  ],\n";
+	json_content << "  \"tested_combination_count\": " << combo_idx << ",\n";
+	json_content << "  \"exported_combination_count\": " << exported_combo_idx << ",\n";
+	json_content << "  \"export_filter\": \"weld_result.polyline_count > 0\"\n";
+	json_content << "}\n";
 
 	// 写入 JS 数据文件（供 HTML 通过 <script> 标签加载，兼容 file:// 协议）
 	const fs::path js_path = result_dir / "weld_results.js";
@@ -1548,5 +1725,8 @@ void test_weld_with_real_models_and_export() {
 	assert(fs::exists(json_path));
 	assert(fs::exists(html_path));
 	assert(combo_idx > 0);
+	assert(exported_combo_idx >= 0);
 	std::cout << "\n全部 " << combo_idx << " 组焊缝计算完成。\n";
+	std::cout << "HTML/JSON 仅导出 " << exported_combo_idx
+		<< " 组存在焊缝的结果。\n";
 }

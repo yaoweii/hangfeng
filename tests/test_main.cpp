@@ -25,6 +25,7 @@ void test_weld_curve_result_layout();
 void test_api_get_plane_panel_reads_plane_panel_from_model_files();
 void test_api_get_surface_reads_surface_panel_from_model_files();
 void test_api_get_plane_reads_fb03c_166f_plate1_as_plane_panel();
+void test_api_get_plane_panel_groups_axis_aligned_noisy_model_loops();
 void test_api_get_plane_panel_builds_faces_from_rxy_boundary_input();
 void test_api_get_plane_panel_builds_inner_holes_from_rxy_input();
 void test_api_get_plane_panel_samples_arc_segments_into_polylines();
@@ -40,6 +41,8 @@ void test_api_get_plane_surface_weld_detects_plane_boundary_coplanar_with_surfac
 void test_api_get_plane_surface_weld_detects_plane_boundary_inside_surface_solid();
 void test_compute_plane_surface_weld_detects_exact_band_without_sampling_loss();
 void test_api_get_plane_surface_weld_detects_plane_boundary_near_surface_exterior_side();
+void test_compute_plane_surface_weld_merges_touching_weld_polylines();
+void test_hanfeng_fit_weld_splines_converts_line_and_arc_polylines();
 
 // --- 真实模型导出测试 ---
 void test_weld_with_real_models_and_export();
@@ -47,6 +50,9 @@ void test_weld_with_real_models_and_export();
 #if HANFENG_WELD_ONLY_TESTS
 
 int main() {
+	test_hanfeng_fit_weld_splines_converts_line_and_arc_polylines();
+	test_compute_plane_surface_weld_merges_touching_weld_polylines();
+	test_api_get_plane_panel_groups_axis_aligned_noisy_model_loops();
 	test_weld_with_real_models_and_export();
 	return 0;
 }
@@ -65,6 +71,7 @@ int main() {
 	test_api_get_plane_panel_reads_plane_panel_from_model_files();
 	test_api_get_surface_reads_surface_panel_from_model_files();
 	test_api_get_plane_reads_fb03c_166f_plate1_as_plane_panel();
+	test_api_get_plane_panel_groups_axis_aligned_noisy_model_loops();
 	test_api_get_plane_panel_builds_faces_from_rxy_boundary_input();
 	test_api_get_plane_panel_builds_inner_holes_from_rxy_input();
 	test_api_get_plane_panel_samples_arc_segments_into_polylines();
@@ -79,6 +86,8 @@ int main() {
 	test_api_get_plane_surface_weld_detects_plane_boundary_inside_surface_solid();
 	test_compute_plane_surface_weld_detects_exact_band_without_sampling_loss();
 	test_api_get_plane_surface_weld_detects_plane_boundary_near_surface_exterior_side();
+	test_compute_plane_surface_weld_merges_touching_weld_polylines();
+	test_hanfeng_fit_weld_splines_converts_line_and_arc_polylines();
 	return 0;
 }
 

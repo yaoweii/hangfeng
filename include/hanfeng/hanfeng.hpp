@@ -14,6 +14,11 @@ namespace hanfeng {
 		const SurfacePanel& surface_panel,
 		double tolerance = 1.0);
 
+	WeldSplineResult api_get_plane_surface_weld_splines(const PlanePanel& plane_panel,
+		const SurfacePanel& surface_panel,
+		double tolerance = 1.0,
+		double fit_tolerance = 1.0e-3);
+
 }  // namespace hanfeng
 
 #endif

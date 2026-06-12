@@ -64,6 +64,10 @@ namespace hanfeng {
 		const SurfacePanel& surface_panel,
 		double tolerance = 1.0);
 
+	WeldSplineResult hanfeng_fit_weld_splines(
+		const WeldCurveResult& weld_result,
+		double tolerance = 1.0e-3);
+
 	/// 重置焊缝性能分析数据
 	void hanfeng_reset_weld_profiling_data();
 

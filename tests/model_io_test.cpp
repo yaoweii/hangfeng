@@ -225,6 +225,37 @@ void test_api_get_plane_reads_fb03c_166f_plate1_as_plane_panel() {
 	assert(panel.face_b.boundaries.inner_loops.size() == 6U);
 }
 
+void test_api_get_plane_panel_groups_axis_aligned_noisy_model_loops() {
+	struct ExpectedPanel {
+		const char* name;
+		std::size_t inner_loop_count_per_face;
+	};
+
+	const ExpectedPanel panels[] = {
+		{ "FB03C-0LB-PLATE1", 4U },
+		{ "FB03C-162F-PLATE1", 1U },
+		{ "FB03C-162FA-CLIP2", 1U },
+		{ "FB03C-162FA-CLIP5", 1U },
+		{ "FB03C-162FA-PLATE2", 1U },
+		{ "FB03C-163F-PLATE1", 1U },
+		{ "FB03C-164FE-PLATE1", 1U },
+	};
+
+	for (const ExpectedPanel& expected : panels) {
+		const std::filesystem::path model_path =
+			std::filesystem::path(HANFENG_SOURCE_DIR) /
+			"model/plane_panels" / expected.name;
+		const hanfeng::PlanePanel panel = hanfeng::api_get_plane_panel(model_path);
+
+		assert(panel.face_a.boundaries.outer_loops.size() == 1U);
+		assert(panel.face_b.boundaries.outer_loops.size() == 1U);
+		assert(panel.face_a.boundaries.inner_loops.size() ==
+			expected.inner_loop_count_per_face);
+		assert(panel.face_b.boundaries.inner_loops.size() ==
+			expected.inner_loop_count_per_face);
+	}
+}
+
 void test_api_get_plane_panel_builds_faces_from_rxy_boundary_input() {
 	float boundary[1000][3];
 	float holes[20][1000][3];
