@@ -1251,6 +1251,55 @@ namespace hanfeng {
 			return geometry;
 		}
 
+		using QuantizedPointKey = std::array<long long, 3>;
+		using QuantizedEdgeKey = std::array<QuantizedPointKey, 2>;
+
+		QuantizedPointKey quantized_point_key(const SPAposition& point) {
+			constexpr double scale = 1.0e6;
+			return QuantizedPointKey{
+				static_cast<long long>(std::llround(point.x() * scale)),
+				static_cast<long long>(std::llround(point.y() * scale)),
+				static_cast<long long>(std::llround(point.z() * scale))
+			};
+		}
+
+		QuantizedEdgeKey quantized_edge_key(const SPAposition& first,
+			const SPAposition& second) {
+			QuantizedPointKey first_key = quantized_point_key(first);
+			QuantizedPointKey second_key = quantized_point_key(second);
+			if (second_key < first_key) {
+				std::swap(first_key, second_key);
+			}
+			return QuantizedEdgeKey{ first_key, second_key };
+		}
+
+		bool surface_geometry_is_closed(const SurfaceGeometry& geometry) {
+			if (geometry.triangles.empty()) {
+				return false;
+			}
+
+			std::vector<QuantizedEdgeKey> edges;
+			edges.reserve(geometry.triangles.size() * 3U);
+			for (const Triangle3& triangle : geometry.triangles) {
+				edges.push_back(quantized_edge_key(triangle.a, triangle.b));
+				edges.push_back(quantized_edge_key(triangle.b, triangle.c));
+				edges.push_back(quantized_edge_key(triangle.c, triangle.a));
+			}
+
+			std::sort(edges.begin(), edges.end());
+			for (std::size_t index = 0; index < edges.size();) {
+				std::size_t next = index + 1U;
+				while (next < edges.size() && edges[next] == edges[index]) {
+					++next;
+				}
+				if (next - index != 2U) {
+					return false;
+				}
+				index = next;
+			}
+			return true;
+		}
+
 		/// 点到曲面几何的最短距离（BVH 加速裁剪）
 		double point_to_surface_geometry_distance(const SPAposition& point,
 			const SurfaceGeometry& geometry) {
@@ -1921,32 +1970,33 @@ namespace hanfeng {
 			return normalise_intervals(std::move(result));
 		}
 
-		/// 从平面板候选环出发，综合拓扑共面/体内/近距三种方式计算线段与曲面的焊缝区间
-		std::vector<Interval> exact_segment_surface_intervals_from_plane_candidate(
+		/// 从候选环出发，综合拓扑共面/体内/近距三种方式计算线段与曲面的焊缝区间
+		std::vector<Interval> exact_segment_surface_intervals_from_candidate(
 			const SPAposition& start,
 			const SPAposition& end,
 			const SurfaceGeometry& geometry,
 			double tolerance,
-			const SPAunit_vector& /*outward_normal*/,
-			const PlanePanelGeometry& /*source_geometry*/) {
+			bool include_inside_intervals) {
 			const std::vector<Interval> topo_intervals =
 				exact_segment_topo_coplanar_intervals(start, end, geometry);
 			const std::vector<Interval> non_coplanar_intervals =
 				complement_on_unit_interval(topo_intervals);
 
 			std::vector<Interval> inside_intervals;
-			for (const Interval& interval : non_coplanar_intervals) {
-				const SPAposition subsegment_start =
-					interpolate_position(start, end, interval.start);
-				const SPAposition subsegment_end =
-					interpolate_position(start, end, interval.end);
-				const std::vector<Interval> local_inside =
-					exact_segment_inside_intervals_on_subsegment(
-						subsegment_start, subsegment_end, geometry);
-				const std::vector<Interval> mapped_inside =
-					remap_intervals_to_parent(local_inside, interval);
-				inside_intervals.insert(inside_intervals.end(),
-					mapped_inside.begin(), mapped_inside.end());
+			if (include_inside_intervals) {
+				for (const Interval& interval : non_coplanar_intervals) {
+					const SPAposition subsegment_start =
+						interpolate_position(start, end, interval.start);
+					const SPAposition subsegment_end =
+						interpolate_position(start, end, interval.end);
+					const std::vector<Interval> local_inside =
+						exact_segment_inside_intervals_on_subsegment(
+							subsegment_start, subsegment_end, geometry);
+					const std::vector<Interval> mapped_inside =
+						remap_intervals_to_parent(local_inside, interval);
+					inside_intervals.insert(inside_intervals.end(),
+						mapped_inside.begin(), mapped_inside.end());
+				}
 			}
 			inside_intervals = normalise_intervals(std::move(inside_intervals));
 
@@ -1979,6 +2029,18 @@ namespace hanfeng {
 			weld_intervals.insert(weld_intervals.end(),
 				near_intervals.begin(), near_intervals.end());
 			return normalise_intervals(std::move(weld_intervals));
+		}
+
+		/// 从平面板候选环出发，综合拓扑共面/体内/近距三种方式计算线段与曲面的焊缝区间
+		std::vector<Interval> exact_segment_surface_intervals_from_plane_candidate(
+			const SPAposition& start,
+			const SPAposition& end,
+			const SurfaceGeometry& geometry,
+			double tolerance,
+			const SPAunit_vector& /*outward_normal*/,
+			const PlanePanelGeometry& /*source_geometry*/) {
+			return exact_segment_surface_intervals_from_candidate(
+				start, end, geometry, tolerance, true);
 		}
 
 		/// 计算线段与平面板的命中区间（主面带状距离 + 侧壁三角形距离）
@@ -2702,6 +2764,83 @@ namespace hanfeng {
 							return exact_segment_surface_intervals_from_plane_candidate(
 								start, end, surface_geometry, tolerance,
 								candidate.outward_normal, plane_geometry);
+						});
+				all_polylines.insert(all_polylines.end(), clipped.begin(), clipped.end());
+			}
+		}
+
+		WeldCurveResult result;
+		{
+			ScopedDurationAccumulator timer(g_weld_profiling_data.deduplicate_ms);
+			result.polylines = hanfeng_deduplicate_polylines(
+				hanfeng_merge_touching_polylines(
+					hanfeng_deduplicate_polylines(all_polylines, tolerance),
+					tolerance),
+				tolerance);
+		}
+		g_weld_profiling_data.total_ms = std::chrono::duration<double, std::milli>(
+			ProfilingClock::now() - total_start).count();
+		return result;
+	}
+
+	WeldCurveResult hanfeng_compute_surface_surface_weld(
+		const SurfacePanel& first_panel,
+		const SurfacePanel& second_panel,
+		double tolerance) {
+		hanfeng_reset_weld_profiling_data();
+		const ProfilingClock::time_point total_start = ProfilingClock::now();
+
+		SurfaceGeometry first_geometry;
+		SurfaceGeometry second_geometry;
+		{
+			ScopedDurationAccumulator timer(g_weld_profiling_data.build_surface_geometry_ms);
+			first_geometry = build_surface_geometry(first_panel);
+			second_geometry = build_surface_geometry(second_panel);
+		}
+		g_weld_profiling_data.surface_triangle_count =
+			first_geometry.triangles.size() + second_geometry.triangles.size();
+
+		const bool first_is_closed = surface_geometry_is_closed(first_geometry);
+		const bool second_is_closed = surface_geometry_is_closed(second_geometry);
+
+		std::vector<Polyline3> first_candidates;
+		std::vector<Polyline3> second_candidates;
+		{
+			ScopedDurationAccumulator timer(
+				g_weld_profiling_data.collect_surface_candidates_ms);
+			first_candidates = hanfeng_collect_surface_candidate_loops(first_panel);
+			second_candidates = hanfeng_collect_surface_candidate_loops(second_panel);
+		}
+		g_weld_profiling_data.surface_candidate_loop_count =
+			first_candidates.size() + second_candidates.size();
+		for (const Polyline3& loop : first_candidates) {
+			g_weld_profiling_data.surface_candidate_segment_count +=
+				candidate_loop_segment_count(loop);
+		}
+		for (const Polyline3& loop : second_candidates) {
+			g_weld_profiling_data.surface_candidate_segment_count +=
+				candidate_loop_segment_count(loop);
+		}
+
+		std::vector<WeldPolyline> all_polylines;
+		{
+			ScopedDurationAccumulator timer(
+				g_weld_profiling_data.clip_surface_candidates_ms);
+			for (const Polyline3& loop : first_candidates) {
+				const std::vector<WeldPolyline> clipped =
+					hanfeng_clip_candidate_loop(loop, tolerance,
+						[&](const SPAposition& start, const SPAposition& end) {
+							return exact_segment_surface_intervals_from_candidate(
+								start, end, second_geometry, tolerance, second_is_closed);
+						});
+				all_polylines.insert(all_polylines.end(), clipped.begin(), clipped.end());
+			}
+			for (const Polyline3& loop : second_candidates) {
+				const std::vector<WeldPolyline> clipped =
+					hanfeng_clip_candidate_loop(loop, tolerance,
+						[&](const SPAposition& start, const SPAposition& end) {
+							return exact_segment_surface_intervals_from_candidate(
+								start, end, first_geometry, tolerance, first_is_closed);
 						});
 				all_polylines.insert(all_polylines.end(), clipped.begin(), clipped.end());
 			}

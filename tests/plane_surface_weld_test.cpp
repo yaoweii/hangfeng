@@ -7,8 +7,9 @@
 //   - 合成数据：平面板边界在曲面板内部的焊缝检测
 //   - 真实模型：平面板 × 曲面板全组合焊缝计算，仅导出存在焊缝的组合
 //
-// PLANE_SURFACE_TEST 宏控制：
-//   定义时，test_main.cpp 只调用 test_weld_with_real_models_and_export()
+// 真实模型宏控制：
+//   HANFENG_PLANE_SURFACE_REAL_MODEL_TESTS=1 时，只调用平面板/曲面板全量真实模型测试
+//   HANFENG_SURFACE_SURFACE_REAL_MODEL_TESTS=1 时，只调用曲面板/曲面板全量真实模型测试
 // =============================================================================
 
 #include <cassert>
@@ -1270,6 +1271,195 @@ void test_compute_plane_surface_weld_merges_touching_weld_polylines() {
 	assert(forward || reversed);
 }
 
+void test_api_get_surface_surface_weld_detects_boundary_on_surface_face() {
+	hanfeng::SurfacePanel first_panel;
+	first_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(0.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 10.0, 0.0),
+		hanfeng::SPAposition(0.0, 10.0, 0.0)));
+
+	hanfeng::SurfacePanel second_panel;
+	second_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(2.0, 5.0, 0.0),
+		hanfeng::SPAposition(8.0, 5.0, 0.0),
+		hanfeng::SPAposition(8.0, 5.0, 4.0),
+		hanfeng::SPAposition(2.0, 5.0, 4.0)));
+
+	const hanfeng::WeldCurveResult result =
+		hanfeng::api_get_surface_surface_weld(first_panel, second_panel, 0.1);
+
+	bool found_shared_edge = false;
+	for (const hanfeng::WeldPolyline& polyline : result.polylines) {
+		if (polyline_matches_segment(polyline,
+			hanfeng::SPAposition(2.0, 5.0, 0.0),
+			hanfeng::SPAposition(8.0, 5.0, 0.0))) {
+			found_shared_edge = true;
+			break;
+		}
+	}
+	assert(found_shared_edge);
+}
+
+void test_api_get_surface_surface_weld_from_raw_mesh_matches_panel_api() {
+	float first_vertices[4][3] = {
+		{ 0.0f, 0.0f, 0.0f },
+		{ 10.0f, 0.0f, 0.0f },
+		{ 10.0f, 10.0f, 0.0f },
+		{ 0.0f, 10.0f, 0.0f }
+	};
+	int first_triangles[2][3] = {
+		{ 0, 1, 2 },
+		{ 0, 2, 3 }
+	};
+	float first_normals[4][3] = {
+		{ 0.0f, 0.0f, 1.0f },
+		{ 0.0f, 0.0f, 1.0f },
+		{ 0.0f, 0.0f, 1.0f },
+		{ 0.0f, 0.0f, 1.0f }
+	};
+
+	float second_vertices[4][3] = {
+		{ 2.0f, 5.0f, 0.0f },
+		{ 8.0f, 5.0f, 0.0f },
+		{ 8.0f, 5.0f, 4.0f },
+		{ 2.0f, 5.0f, 4.0f }
+	};
+	int second_triangles[2][3] = {
+		{ 0, 1, 2 },
+		{ 0, 2, 3 }
+	};
+	float second_normals[4][3] = {
+		{ 0.0f, -1.0f, 0.0f },
+		{ 0.0f, -1.0f, 0.0f },
+		{ 0.0f, -1.0f, 0.0f },
+		{ 0.0f, -1.0f, 0.0f }
+	};
+
+	const hanfeng::SurfacePanel first_panel =
+		hanfeng::api_get_surface_panel(first_vertices, 4, first_triangles, 2,
+			first_normals);
+	const hanfeng::SurfacePanel second_panel =
+		hanfeng::api_get_surface_panel(second_vertices, 4, second_triangles, 2,
+			second_normals);
+
+	const hanfeng::WeldCurveResult panel_result =
+		hanfeng::api_get_surface_surface_weld(first_panel, second_panel, 0.1);
+	const hanfeng::WeldCurveResult raw_result =
+		hanfeng::api_get_surface_surface_weld(
+			first_vertices, 4, first_triangles, 2, first_normals,
+			second_vertices, 4, second_triangles, 2, second_normals,
+			0.1);
+
+	assert(raw_result.polylines.size() == panel_result.polylines.size());
+	bool found_shared_edge = false;
+	for (const hanfeng::WeldPolyline& polyline : raw_result.polylines) {
+		if (polyline_matches_segment(polyline,
+			hanfeng::SPAposition(2.0, 5.0, 0.0),
+			hanfeng::SPAposition(8.0, 5.0, 0.0))) {
+			found_shared_edge = true;
+			break;
+		}
+	}
+	assert(found_shared_edge);
+}
+
+void test_api_get_surface_surface_weld_detects_boundary_inside_surface_solid() {
+	hanfeng::SurfacePanel first_panel;
+	first_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(0.5, 2.0, 2.0),
+		hanfeng::SPAposition(0.5, 8.0, 2.0),
+		hanfeng::SPAposition(0.5, 8.0, 3.0),
+		hanfeng::SPAposition(0.5, 2.0, 3.0)));
+	const hanfeng::SurfacePanel second_panel = make_surface_box_panel();
+
+	const hanfeng::WeldCurveResult result =
+		hanfeng::api_get_surface_surface_weld(first_panel, second_panel, 0.1);
+
+	bool found_inside_loop = false;
+	for (const hanfeng::WeldPolyline& polyline : result.polylines) {
+		if (polyline_matches_rectangle_on_x_face(polyline, 0.5, 2.0, 8.0, 2.0, 3.0)) {
+			found_inside_loop = true;
+			break;
+		}
+	}
+	assert(found_inside_loop);
+}
+
+void test_api_get_surface_surface_weld_detects_near_boundary() {
+	hanfeng::SurfacePanel first_panel;
+	first_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(-0.5, 2.0, 2.0),
+		hanfeng::SPAposition(-0.5, 8.0, 2.0),
+		hanfeng::SPAposition(-0.5, 8.0, 3.0),
+		hanfeng::SPAposition(-0.5, 2.0, 3.0)));
+	const hanfeng::SurfacePanel second_panel =
+		make_box_surface_panel(0.0, 1.0, 0.0, 10.0, 0.0, 10.0, false);
+
+	const hanfeng::WeldCurveResult result =
+		hanfeng::api_get_surface_surface_weld(first_panel, second_panel, 1.0);
+
+	bool found_near_loop = false;
+	for (const hanfeng::WeldPolyline& polyline : result.polylines) {
+		if (polyline_matches_rectangle_on_x_face(polyline, -0.5, 2.0, 8.0, 2.0, 3.0)) {
+			found_near_loop = true;
+			break;
+		}
+	}
+	assert(found_near_loop);
+}
+
+void test_api_get_surface_surface_weld_deduplicates_bidirectional_matches() {
+	hanfeng::SurfacePanel first_panel;
+	first_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(0.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 10.0, 0.0),
+		hanfeng::SPAposition(0.0, 10.0, 0.0)));
+
+	hanfeng::SurfacePanel second_panel;
+	second_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(0.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 10.0, 0.0),
+		hanfeng::SPAposition(0.0, 10.0, 0.0)));
+
+	const hanfeng::WeldCurveResult result =
+		hanfeng::api_get_surface_surface_weld(first_panel, second_panel, 0.1);
+
+	assert(result.polylines.size() == 1U);
+}
+
+void test_api_get_surface_surface_weld_splines_returns_rxyz_and_tangent() {
+	hanfeng::SurfacePanel first_panel;
+	first_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(0.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 0.0, 0.0),
+		hanfeng::SPAposition(10.0, 10.0, 0.0),
+		hanfeng::SPAposition(0.0, 10.0, 0.0)));
+
+	hanfeng::SurfacePanel second_panel;
+	second_panel.surfaces.push_back(make_rect_patch(
+		hanfeng::SPAposition(2.0, 5.0, 0.0),
+		hanfeng::SPAposition(8.0, 5.0, 0.0),
+		hanfeng::SPAposition(8.0, 5.0, 4.0),
+		hanfeng::SPAposition(2.0, 5.0, 4.0)));
+
+	const hanfeng::WeldSplineResult result =
+		hanfeng::api_get_surface_surface_weld_splines(
+			first_panel, second_panel, 0.1, 1.0e-3);
+
+	assert(!result.welds.empty());
+	const hanfeng::WeldSpline& weld = result.welds.front();
+	assert(weld.raw_points.size() >= 2U);
+	assert(weld.points_rxyz.header_matches_point_count());
+	assert(weld.points_rxyz.geometry_point_count() >= 2U);
+	assert(nearly_equal(weld.reference_point.x(), weld.raw_points.front().x()));
+	assert(nearly_equal(weld.reference_point.y(), weld.raw_points.front().y()));
+	assert(nearly_equal(weld.reference_point.z(), weld.raw_points.front().z()));
+	assert(nearly_equal(weld.tangent_direction.vector().len(), 1.0, 1.0e-6));
+}
+
 // =============================================================================
 // 真实模型焊缝测试：12 组组合，带计时与结果导出
 // =============================================================================
@@ -1728,5 +1918,375 @@ void test_weld_with_real_models_and_export() {
 	assert(exported_combo_idx >= 0);
 	std::cout << "\n全部 " << combo_idx << " 组焊缝计算完成。\n";
 	std::cout << "HTML/JSON 仅导出 " << exported_combo_idx
+		<< " 组存在焊缝的结果。\n";
+}
+
+void test_surface_surface_weld_with_real_models() {
+	namespace fs = std::filesystem;
+	using clock = std::chrono::steady_clock;
+
+	const fs::path source_dir(HANFENG_SOURCE_DIR);
+	const fs::path metadata_path = source_dir / "model" / "metadata.json";
+	const fs::path result_dir = source_dir / "result";
+	fs::create_directories(result_dir);
+
+	std::vector<PanelEntry> entries = parse_metadata(metadata_path);
+	std::vector<PanelEntry> surface_entries;
+	for (const auto& entry : entries) {
+		if (entry.category == "surface") {
+			surface_entries.push_back(entry);
+		}
+	}
+
+	std::cout << "曲面板数量: " << surface_entries.size() << "\n";
+	const std::size_t declared_combination_count = surface_entries.size() < 2U
+		? 0U
+		: surface_entries.size() * (surface_entries.size() - 1U) / 2U;
+	std::cout << "曲面板配对组合数: "
+		<< declared_combination_count << "\n\n";
+
+	std::vector<LoadedSurfaceEntry> loaded_surfaces;
+	loaded_surfaces.reserve(surface_entries.size());
+	for (const PanelEntry& surface_entry : surface_entries) {
+		LoadedSurfaceEntry loaded;
+		loaded.entry = surface_entry;
+
+		auto t0 = clock::now();
+		try {
+			loaded.panel = hanfeng::api_get_surface_panel(surface_entry.directory);
+		}
+		catch (const std::exception& ex) {
+			std::cerr << "ERROR loading surface: " << surface_entry.name
+				<< ": " << ex.what() << "\n";
+			continue;
+		}
+		auto t1 = clock::now();
+
+		loaded.load_panel_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+		loaded_surfaces.push_back(std::move(loaded));
+	}
+
+	const std::size_t total_combination_count =
+		loaded_surfaces.size() < 2U
+			? 0U
+			: loaded_surfaces.size() * (loaded_surfaces.size() - 1U) / 2U;
+	std::cout << "可测试曲面板数量: " << loaded_surfaces.size() << "\n";
+	std::cout << "可测试曲面板配对组合数: " << total_combination_count << "\n\n";
+
+	std::ostringstream json_content;
+	json_content << "{\n";
+	json_content << "  \"tolerance\": 1.0,\n";
+	json_content << "  \"weld_fit_tolerance\": 0.001,\n";
+	json_content << "  \"combination_count\": " << total_combination_count << ",\n";
+	json_content << "  \"combination_mode\": \"surface_surface_unique_pairs\",\n";
+	json_content << "  \"export_filter\": \"weld_result.polyline_count > 0\",\n";
+	json_content << "  \"combinations\": [\n";
+
+	bool first_combo = true;
+	std::size_t combo_idx = 0;
+	std::size_t exported_combo_idx = 0;
+
+	for (std::size_t first_index = 0; first_index < loaded_surfaces.size(); ++first_index) {
+		for (std::size_t second_index = first_index + 1U;
+			second_index < loaded_surfaces.size(); ++second_index) {
+			++combo_idx;
+			if (combo_idx == 1U || combo_idx % 100U == 0U) {
+				std::cout << "[" << combo_idx << "/" << total_combination_count
+					<< "] 已测试，当前有焊缝组合: " << exported_combo_idx << "\n";
+			}
+
+			const LoadedSurfaceEntry& first_loaded = loaded_surfaces[first_index];
+			const LoadedSurfaceEntry& second_loaded = loaded_surfaces[second_index];
+			const std::string combo_label =
+				first_loaded.entry.name + " x " + second_loaded.entry.name;
+
+			auto combo_start = clock::now();
+			auto t0 = clock::now();
+			hanfeng::WeldCurveResult weld_result;
+			try {
+				weld_result = hanfeng::api_get_surface_surface_weld(
+					first_loaded.panel, second_loaded.panel, 1.0);
+			}
+			catch (const std::exception& ex) {
+				std::cerr << "  ERROR computing surface-surface weld: "
+					<< combo_label << ": " << ex.what() << "\n";
+				continue;
+			}
+			const hanfeng::WeldProfilingData profiling =
+				hanfeng::hanfeng_get_weld_profiling_data();
+			auto t1 = clock::now();
+
+			if (weld_result.polylines.empty()) {
+				continue;
+			}
+
+			const hanfeng::WeldSplineResult weld_splines =
+				hanfeng::hanfeng_fit_weld_splines(weld_result, 1.0e-3);
+			auto t2 = clock::now();
+			assert(weld_splines.welds.size() == weld_result.polylines.size());
+
+			auto combo_end = clock::now();
+			const double ms_compute_weld =
+				std::chrono::duration<double, std::milli>(t1 - t0).count();
+			const double ms_fit_weld =
+				std::chrono::duration<double, std::milli>(t2 - t1).count();
+			const double ms_total =
+				std::chrono::duration<double, std::milli>(combo_end - combo_start).count();
+
+			++exported_combo_idx;
+			std::cout << "[" << combo_idx << "/" << total_combination_count
+				<< "] " << combo_label << "\n";
+			std::cout << "  命中焊缝组合序号: " << exported_combo_idx << "\n";
+			std::cout << "  预加载曲面板1: " << first_loaded.load_panel_ms << " ms\n";
+			std::cout << "  预加载曲面板2: " << second_loaded.load_panel_ms << " ms\n";
+			std::cout << "  计算焊缝:   " << ms_compute_weld << " ms\n";
+			std::cout << "  rxyz fit:   " << ms_fit_weld << " ms\n";
+			std::cout << "  总耗时:     " << ms_total << " ms\n";
+			std::cout << "  焊缝段数:   " << weld_result.polylines.size() << "\n";
+			std::cout << "  Profiling(total/build/clip_surface): "
+				<< profiling.total_ms << " / "
+				<< profiling.build_surface_geometry_ms << " / "
+				<< profiling.clip_surface_candidates_ms << " ms\n";
+			std::cout << "  Profiling(topo/inside/near): "
+				<< profiling.topo_coplanar_ms << " / "
+				<< profiling.inside_ms << " / "
+				<< profiling.near_ms << " ms\n";
+			std::cout << "  Profiling(surface loops/segments): "
+				<< profiling.surface_candidate_loop_count << " / "
+				<< profiling.surface_candidate_segment_count << "\n\n";
+
+			if (!first_combo) json_content << ",\n";
+			first_combo = false;
+
+			json_content << "    {\n";
+			json_content << "      \"first_surface_panel\": {\"name\": \""
+				<< first_loaded.entry.name << "\", \"path\": \""
+				<< first_loaded.entry.directory << "\"},\n";
+			json_content << "      \"second_surface_panel\": {\"name\": \""
+				<< second_loaded.entry.name << "\", \"path\": \""
+				<< second_loaded.entry.directory << "\"},\n";
+			// 第一个曲面板几何
+				{
+					const hanfeng::SurfacePanel& panel = first_loaded.panel;
+					std::vector<std::array<double, 3>> all_verts;
+					std::vector<std::array<std::size_t, 3>> all_tris;
+					std::vector<std::vector<std::array<double, 3>>> all_boundary;
+
+					for (const auto& patch : panel.surfaces) {
+						std::size_t offset = all_verts.size();
+						for (const auto& v : patch.vertices)
+							all_verts.push_back({ v.x(), v.y(), v.z() });
+						for (const auto& tri : patch.triangles)
+							all_tris.push_back({ offset + tri[0], offset + tri[1], offset + tri[2] });
+						auto collect = [&](const std::vector<hanfeng::Polyline3>& loops) {
+							for (const auto& loop : loops) {
+								std::vector<std::array<double, 3>> pts;
+								for (const auto& p : loop) pts.push_back({ p.x(), p.y(), p.z() });
+								all_boundary.push_back(std::move(pts));
+							}
+						};
+						collect(patch.boundaries.outer_loops);
+						collect(patch.boundaries.inner_loops);
+					}
+
+					json_content << "      \"first_vertices\": [\n";
+					for (std::size_t i = 0; i < all_verts.size(); ++i) {
+						json_content << "        [" << all_verts[i][0] << ", " << all_verts[i][1] << ", " << all_verts[i][2] << "]";
+						if (i + 1 < all_verts.size()) json_content << ",";
+						json_content << "\n";
+					}
+					json_content << "      ],\n";
+					json_content << "      \"first_triangles\": [\n";
+					for (std::size_t i = 0; i < all_tris.size(); ++i) {
+						json_content << "        [" << all_tris[i][0] << ", " << all_tris[i][1] << ", " << all_tris[i][2] << "]";
+						if (i + 1 < all_tris.size()) json_content << ",";
+						json_content << "\n";
+					}
+					json_content << "      ],\n";
+					json_content << "      \"first_boundary_loops\": [\n";
+					for (std::size_t li = 0; li < all_boundary.size(); ++li) {
+						json_content << "        [";
+						for (std::size_t pi = 0; pi < all_boundary[li].size(); ++pi) {
+							json_content << "[" << all_boundary[li][pi][0] << ","
+								<< all_boundary[li][pi][1] << ","
+								<< all_boundary[li][pi][2] << "]";
+							if (pi + 1 < all_boundary[li].size()) json_content << ", ";
+						}
+						json_content << "]";
+						if (li + 1 < all_boundary.size()) json_content << ",";
+						json_content << "\n";
+					}
+					json_content << "      ],\n";
+				}
+
+				// 第二个曲面板几何
+				{
+					const hanfeng::SurfacePanel& panel = second_loaded.panel;
+					std::vector<std::array<double, 3>> all_verts;
+					std::vector<std::array<std::size_t, 3>> all_tris;
+					std::vector<std::vector<std::array<double, 3>>> all_boundary;
+
+					for (const auto& patch : panel.surfaces) {
+						std::size_t offset = all_verts.size();
+						for (const auto& v : patch.vertices)
+							all_verts.push_back({ v.x(), v.y(), v.z() });
+						for (const auto& tri : patch.triangles)
+							all_tris.push_back({ offset + tri[0], offset + tri[1], offset + tri[2] });
+						auto collect = [&](const std::vector<hanfeng::Polyline3>& loops) {
+							for (const auto& loop : loops) {
+								std::vector<std::array<double, 3>> pts;
+								for (const auto& p : loop) pts.push_back({ p.x(), p.y(), p.z() });
+								all_boundary.push_back(std::move(pts));
+							}
+						};
+						collect(patch.boundaries.outer_loops);
+						collect(patch.boundaries.inner_loops);
+					}
+
+					json_content << "      \"second_vertices\": [\n";
+					for (std::size_t i = 0; i < all_verts.size(); ++i) {
+						json_content << "        [" << all_verts[i][0] << ", " << all_verts[i][1] << ", " << all_verts[i][2] << "]";
+						if (i + 1 < all_verts.size()) json_content << ",";
+						json_content << "\n";
+					}
+					json_content << "      ],\n";
+					json_content << "      \"second_triangles\": [\n";
+					for (std::size_t i = 0; i < all_tris.size(); ++i) {
+						json_content << "        [" << all_tris[i][0] << ", " << all_tris[i][1] << ", " << all_tris[i][2] << "]";
+						if (i + 1 < all_tris.size()) json_content << ",";
+						json_content << "\n";
+					}
+					json_content << "      ],\n";
+					json_content << "      \"second_boundary_loops\": [\n";
+					for (std::size_t li = 0; li < all_boundary.size(); ++li) {
+						json_content << "        [";
+						for (std::size_t pi = 0; pi < all_boundary[li].size(); ++pi) {
+							json_content << "[" << all_boundary[li][pi][0] << ","
+								<< all_boundary[li][pi][1] << ","
+								<< all_boundary[li][pi][2] << "]";
+							if (pi + 1 < all_boundary[li].size()) json_content << ", ";
+						}
+						json_content << "]";
+						if (li + 1 < all_boundary.size()) json_content << ",";
+						json_content << "\n";
+					}
+					json_content << "      ],\n";
+				}
+
+				json_content << "      \"weld_result\": {\n";
+			json_content << "        \"polyline_count\": "
+				<< weld_result.polylines.size() << ",\n";
+			json_content << "        \"polylines\": [\n";
+			for (std::size_t wi = 0; wi < weld_result.polylines.size(); ++wi) {
+				const auto& polyline = weld_result.polylines[wi];
+				const auto& spline = weld_splines.welds[wi];
+				json_content << "          {\"index\": " << wi
+					<< ", \"point_count\": " << polyline.points.size() << ",\n";
+				json_content << "           \"points\": [\n";
+				for (std::size_t pi = 0; pi < polyline.points.size(); ++pi) {
+					json_content << "            [" << polyline.points[pi].x() << ", "
+						<< polyline.points[pi].y() << ", "
+						<< polyline.points[pi].z() << "]";
+					if (pi + 1U < polyline.points.size()) json_content << ",";
+					json_content << "\n";
+				}
+				json_content << "          ],\n";
+				json_content << "           \"points_rxyz\": [\n";
+				for (std::size_t ri = 0; ri < spline.points_rxyz.points.size(); ++ri) {
+					const auto& point = spline.points_rxyz.points[ri];
+					json_content << "            [" << point.r << ", "
+						<< point.x << ", "
+						<< point.y << ", "
+						<< point.z << "]";
+					if (ri + 1U < spline.points_rxyz.points.size()) json_content << ",";
+					json_content << "\n";
+				}
+				json_content << "          ],\n";
+				json_content << "           \"reference_point\": ["
+					<< spline.reference_point.x() << ", "
+					<< spline.reference_point.y() << ", "
+					<< spline.reference_point.z() << "],\n";
+				json_content << "           \"tangent_direction\": ["
+					<< spline.tangent_direction.x() << ", "
+					<< spline.tangent_direction.y() << ", "
+					<< spline.tangent_direction.z() << "]}\n";
+				if (wi + 1U < weld_result.polylines.size()) json_content << ",";
+			}
+			json_content << "        ]\n";
+			json_content << "      },\n";
+			json_content << "      \"timing_ms\": {\n";
+			json_content << "        \"load_first_surface\": "
+				<< first_loaded.load_panel_ms << ",\n";
+			json_content << "        \"load_second_surface\": "
+				<< second_loaded.load_panel_ms << ",\n";
+			json_content << "        \"compute_weld\": " << ms_compute_weld << ",\n";
+			json_content << "        \"fit_weld\": " << ms_fit_weld << ",\n";
+			json_content << "        \"total\": " << ms_total << "\n";
+			json_content << "      },\n";
+			json_content << "      \"profiling\": {\n";
+			json_content << "        \"build_surface_geometry_ms\": "
+				<< profiling.build_surface_geometry_ms << ",\n";
+			json_content << "        \"collect_surface_candidates_ms\": "
+				<< profiling.collect_surface_candidates_ms << ",\n";
+			json_content << "        \"clip_surface_candidates_ms\": "
+				<< profiling.clip_surface_candidates_ms << ",\n";
+			json_content << "        \"deduplicate_ms\": "
+				<< profiling.deduplicate_ms << ",\n";
+			json_content << "        \"total_ms\": "
+				<< profiling.total_ms << ",\n";
+			json_content << "        \"topo_coplanar_ms\": "
+				<< profiling.topo_coplanar_ms << ",\n";
+			json_content << "        \"inside_ms\": "
+				<< profiling.inside_ms << ",\n";
+			json_content << "        \"near_ms\": "
+				<< profiling.near_ms << ",\n";
+			json_content << "        \"surface_triangle_count\": "
+				<< profiling.surface_triangle_count << ",\n";
+			json_content << "        \"surface_candidate_loop_count\": "
+				<< profiling.surface_candidate_loop_count << ",\n";
+			json_content << "        \"surface_candidate_segment_count\": "
+				<< profiling.surface_candidate_segment_count << "\n";
+			json_content << "      }\n";
+			json_content << "    }";
+		}
+	}
+
+	json_content << "\n  ],\n";
+	json_content << "  \"tested_combination_count\": " << combo_idx << ",\n";
+	json_content << "  \"exported_combination_count\": " << exported_combo_idx << "\n";
+	json_content << "}\n";
+
+	const fs::path json_path = result_dir / "surface_surface_weld_results.json";
+	{
+		std::ofstream json_file(json_path);
+		if (!json_file.is_open()) {
+			std::cerr << "Failed to write: " << json_path << "\n";
+		}
+		else {
+			json_file << json_content.str();
+			json_file.close();
+			std::cout << "JSON 结果已写入: " << json_path << "\n";
+		}
+	}
+
+	const fs::path js_path = result_dir / "surface_surface_weld_results.js";
+	{
+		std::ofstream js_file(js_path);
+		if (!js_file.is_open()) {
+			std::cerr << "Failed to write: " << js_path << "\n";
+		}
+		else {
+			js_file << "var SURFACE_SURFACE_WELD_DATA = "
+				<< json_content.str() << ";\n";
+			js_file.close();
+			std::cout << "JS 数据已写入: " << js_path << "\n";
+		}
+	}
+
+	assert(fs::exists(json_path));
+	assert(fs::exists(js_path));
+	assert(combo_idx == total_combination_count);
+	std::cout << "\n全部 " << combo_idx << " 组曲面板配对焊缝计算完成。\n";
+	std::cout << "JSON/JS 仅导出 " << exported_combo_idx
 		<< " 组存在焊缝的结果。\n";
 }
