@@ -1031,6 +1031,226 @@ window.addEventListener('resize', () => { if (DATA) renderCurrent(); });
 		out.close();
 	}
 
+	void write_surface_surface_weld_viewer_html(const std::filesystem::path& html_path,
+		const std::string& json_data) {
+		std::ofstream out(html_path);
+		if (!out.is_open()) {
+			std::cerr << "Failed to create HTML: " << html_path << "\n";
+			return;
+		}
+
+		out << R"html(<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>曲面板-曲面板焊缝结果</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: #202124;
+  background: #f5f7f9;
+}
+header { padding: 24px 28px 10px; }
+h1 { margin: 0 0 8px; font-size: 24px; }
+.summary { color: #5f6670; line-height: 1.6; }
+.layout { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 16px; padding: 16px 24px 28px; }
+.panel {
+  background: #fff;
+  border: 1px solid #d9dee5;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.side { max-height: calc(100vh - 150px); overflow: auto; }
+.combo {
+  width: 100%;
+  display: block;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid #edf0f3;
+  background: #fff;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.combo:hover, .combo.active { background: #eef5ff; }
+.combo strong { display: block; font-size: 13px; word-break: break-all; }
+.combo span { display: block; margin-top: 4px; color: #69717c; font-size: 12px; }
+.toolbar { display: flex; gap: 8px; align-items: center; padding: 12px; border-bottom: 1px solid #edf0f3; }
+button { border: 1px solid #cfd6df; background: #fff; border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+button:hover { background: #f2f6fb; }
+canvas { width: 100%; height: min(68vh, 720px); display: block; background: #fbfcfd; }
+.meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; padding: 14px; color: #535b66; font-size: 13px; border-top: 1px solid #edf0f3; }
+.welds { padding: 14px; border-top: 1px solid #edf0f3; }
+.weld { margin-bottom: 10px; color: #535b66; font-size: 13px; }
+.weld b { color: #202124; }
+@media (max-width: 900px) { .layout { grid-template-columns: 1fr; } canvas { height: 56vh; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>曲面板-曲面板焊缝结果</h1>
+  <div class="summary" id="summary"></div>
+</header>
+<div class="layout">
+  <div class="panel side" id="comboList"></div>
+  <div class="panel">
+    <div class="toolbar">
+      <button id="prevBtn">上一组</button>
+      <button id="nextBtn">下一组</button>
+      <button id="resetBtn">重置视图</button>
+      <span id="title"></span>
+    </div>
+    <canvas id="canvas"></canvas>
+    <div class="meta" id="meta"></div>
+    <div class="welds" id="welds"></div>
+  </div>
+</div>
+<script>
+var SURFACE_SURFACE_WELD_DATA = )html" << json_data << R"html(;
+</script>
+<script>
+const DATA = SURFACE_SURFACE_WELD_DATA;
+const COLORS = ['#d71920', '#1f77b4', '#2ca02c', '#ff7f0e', '#9467bd', '#17becf', '#bcbd22', '#e377c2'];
+let current = 0;
+let scale = 1;
+let panX = 0;
+let panY = 0;
+
+function allWeldPoints(combo) {
+  const pts = [];
+  if (!combo.weld_result) return pts;
+  for (const weld of combo.weld_result.polylines) {
+    for (const p of weld.points) pts.push(p);
+  }
+  return pts;
+}
+
+function bounds(points) {
+  const b = { minX: Infinity, minY: Infinity, minZ: Infinity, maxX: -Infinity, maxY: -Infinity, maxZ: -Infinity };
+  for (const p of points) {
+    b.minX = Math.min(b.minX, p[0]); b.maxX = Math.max(b.maxX, p[0]);
+    b.minY = Math.min(b.minY, p[1]); b.maxY = Math.max(b.maxY, p[1]);
+    b.minZ = Math.min(b.minZ, p[2]); b.maxZ = Math.max(b.maxZ, p[2]);
+  }
+  return b;
+}
+
+function project(p, b, w, h) {
+  const cx = (b.minX + b.maxX) / 2;
+  const cy = (b.minY + b.maxY) / 2;
+  const cz = (b.minZ + b.maxZ) / 2;
+  const extent = Math.max(b.maxX - b.minX, b.maxY - b.minY, b.maxZ - b.minZ, 1);
+  const x = (p[0] - cx) - 0.42 * (p[2] - cz);
+  const y = (p[1] - cy) + 0.28 * (p[2] - cz);
+  const s = Math.min(w, h) * 0.74 / extent * scale;
+  return [w / 2 + panX + x * s, h / 2 + panY - y * s];
+}
+
+function resizeCanvas(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+  canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+}
+
+function render() {
+  const canvas = document.getElementById('canvas');
+  resizeCanvas(canvas);
+  const ctx = canvas.getContext('2d');
+  const combo = DATA.combinations[current];
+  const pts = allWeldPoints(combo);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#fbfcfd';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (pts.length === 0) return;
+  const b = bounds(pts);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  combo.weld_result.polylines.forEach((weld, wi) => {
+    if (weld.points.length < 2) return;
+    ctx.strokeStyle = COLORS[wi % COLORS.length];
+    ctx.lineWidth = Math.max(2, (window.devicePixelRatio || 1) * 2);
+    ctx.beginPath();
+    weld.points.forEach((p, i) => {
+      const pp = project(p, b, canvas.width, canvas.height);
+      if (i === 0) ctx.moveTo(pp[0], pp[1]);
+      else ctx.lineTo(pp[0], pp[1]);
+    });
+    ctx.stroke();
+  });
+}
+
+function updateInfo() {
+  const combo = DATA.combinations[current];
+  document.getElementById('title').textContent =
+    combo.first_surface_panel.name + ' x ' + combo.second_surface_panel.name;
+  document.querySelectorAll('.combo').forEach((el, i) => el.classList.toggle('active', i === current));
+  document.getElementById('meta').innerHTML =
+    '<div>组合序号: ' + (current + 1) + ' / ' + DATA.combinations.length + '</div>' +
+    '<div>焊缝段数: ' + combo.weld_result.polyline_count + '</div>' +
+    '<div>曲面板1: ' + combo.first_surface_panel.name + '</div>' +
+    '<div>曲面板2: ' + combo.second_surface_panel.name + '</div>' +
+    '<div>计算耗时: ' + combo.timing_ms.compute_weld.toFixed(2) + ' ms</div>' +
+    '<div>拟合耗时: ' + combo.timing_ms.fit_weld.toFixed(2) + ' ms</div>';
+  document.getElementById('welds').innerHTML = combo.weld_result.polylines.map((weld, i) =>
+    '<div class="weld"><b style="color:' + COLORS[i % COLORS.length] + '">#' + i +
+    '</b> points=' + weld.point_count +
+    ', reference=[' + weld.reference_point.map(v => v.toFixed(3)).join(', ') +
+    '], tangent=[' + weld.tangent_direction.map(v => v.toFixed(4)).join(', ') + ']</div>'
+  ).join('');
+}
+
+function setCurrent(index) {
+  current = (index + DATA.combinations.length) % DATA.combinations.length;
+  scale = 1; panX = 0; panY = 0;
+  updateInfo();
+  render();
+}
+
+document.getElementById('summary').textContent =
+  '测试组合 ' + DATA.tested_combination_count + ' 组，导出存在焊缝的组合 ' +
+  DATA.exported_combination_count + ' 组。';
+const list = document.getElementById('comboList');
+DATA.combinations.forEach((combo, i) => {
+  const btn = document.createElement('button');
+  btn.className = 'combo';
+  btn.innerHTML = '<strong>' + combo.first_surface_panel.name + ' x ' + combo.second_surface_panel.name +
+    '</strong><span>' + combo.weld_result.polyline_count + ' 条焊缝</span>';
+  btn.onclick = () => setCurrent(i);
+  list.appendChild(btn);
+});
+document.getElementById('prevBtn').onclick = () => setCurrent(current - 1);
+document.getElementById('nextBtn').onclick = () => setCurrent(current + 1);
+document.getElementById('resetBtn').onclick = () => setCurrent(current);
+document.getElementById('canvas').addEventListener('wheel', e => {
+  e.preventDefault();
+  scale = Math.max(0.2, Math.min(12, scale * (e.deltaY < 0 ? 1.12 : 0.89)));
+  render();
+}, { passive: false });
+let dragging = false, lastX = 0, lastY = 0;
+document.getElementById('canvas').addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener('pointerup', () => dragging = false);
+window.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const ratio = window.devicePixelRatio || 1;
+  panX += (e.clientX - lastX) * ratio;
+  panY += (e.clientY - lastY) * ratio;
+  lastX = e.clientX; lastY = e.clientY;
+  render();
+});
+window.addEventListener('resize', render);
+if (DATA.combinations.length > 0) setCurrent(0);
+</script>
+</body>
+</html>
+)html";
+
+		out.close();
+	}
+
 }  // namespace
 
 // =============================================================================
@@ -2283,10 +2503,15 @@ void test_surface_surface_weld_with_real_models() {
 		}
 	}
 
+	const fs::path html_path = result_dir / "surface_surface_weld_viewer.html";
+	write_surface_surface_weld_viewer_html(html_path, json_content.str());
+	std::cout << "HTML 可视化已写入: " << html_path << "\n";
+
 	assert(fs::exists(json_path));
 	assert(fs::exists(js_path));
+	assert(fs::exists(html_path));
 	assert(combo_idx == total_combination_count);
 	std::cout << "\n全部 " << combo_idx << " 组曲面板配对焊缝计算完成。\n";
-	std::cout << "JSON/JS 仅导出 " << exported_combo_idx
+	std::cout << "HTML/JSON/JS 仅导出 " << exported_combo_idx
 		<< " 组存在焊缝的结果。\n";
 }

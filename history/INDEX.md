@@ -1,5 +1,14 @@
 # History Index
 
+## 2026-06-13 曲面板-曲面板焊缝接口与真实模型测试
+**文件**: [2026-06-13-surface-surface-weld-api-and-real-model-tests.md](2026-06-13-surface-surface-weld-api-and-real-model-tests.md)
+
+新增曲面板-曲面板焊缝检查接口，包含 `SurfacePanel + SurfacePanel` 核心接口和 raw mesh 便利重载；复用现有曲面边界、BVH、候选裁剪、端点合并、去重和 `rxyz` 后处理。测试入口拆分为 `HANFENG_PLANE_SURFACE_REAL_MODEL_TESTS` 与 `HANFENG_SURFACE_SURFACE_REAL_MODEL_TESTS` 两个真实模型宏，默认只跑轻量测试。曲面-曲面真实模型测试完成 85 个曲面板的 3570 组不重复配对，导出 194 组有焊缝结果，并生成 JSON/JS/HTML。
+
+**关键词**: 曲面板-曲面板焊缝, SurfacePanel, raw mesh, 真实模型宏, HTML可视化, rxyz, 边界贴靠
+
+---
+
 ## 2026-06-13 FB03C 焊缝导出与平面板分组修复
 **文件**: [2026-06-13-fb03c-weld-export-plane-grouping-fix.md](2026-06-13-fb03c-weld-export-plane-grouping-fix.md)
 
